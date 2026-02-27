@@ -1,0 +1,1184 @@
+# ====================================
+# Power BI Workspace Permission Manager
+# ====================================
+# This script allows you to add or remove workspace permissions
+# for the current user using Power BI Admin APIs
+
+$ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
+
+# Temporarily set execution policy to Bypass for this session
+if ((Get-ExecutionPolicy) -ne 'Bypass') {
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+}
+
+Write-Host ""
+Write-Host "======================================"
+Write-Host "Workspace Permission Manager"
+Write-Host "======================================"
+Write-Host ""
+
+# =============================
+# Check Required Modules
+# =============================
+
+$requiredModules = @( 'MicrosoftPowerBIMgmt' )
+foreach ($module in $requiredModules) {
+    if( -not (Import-Module $module -PassThru -ErrorAction ignore) ) {
+       Install-Module -Name $module -Scope CurrentUser -Force
+    }
+
+    Import-Module $Module -ErrorAction 'stop'
+}
+
+# =============================
+# Environment Selection Dialog
+# =============================
+
+function Show-EnvironmentSelectionDialog {
+    param(
+        [int]$TimeoutSeconds = 60
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Power BI Environment"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(400, 320)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Label
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Select your Power BI cloud environment:"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $form.Controls.Add($label)
+
+    # ListBox for environment selection
+    $listBox = New-Object System.Windows.Forms.ListBox
+    $listBox.Location = New-Object System.Drawing.Point(20, 50)
+    $listBox.Size = New-Object System.Drawing.Size(340, 150)
+    $listBox.SelectionMode = 'One'
+    
+    # Add environment options
+    $environments = @(
+        'Public (Commercial)',
+        'Germany',
+        'USGov',
+        'China',
+        'USGovHigh',
+        'USGovMil'
+    )
+    
+    foreach ($env in $environments) {
+        [void]$listBox.Items.Add($env)
+    }
+    
+    # Set default selection to Public
+    $listBox.SelectedIndex = 0
+    $form.Controls.Add($listBox)
+
+    # Timeout label
+    $timeoutLabel = New-Object System.Windows.Forms.Label
+    $timeoutLabel.Text = "Timeout in $TimeoutSeconds seconds (defaults to Public)"
+    $timeoutLabel.AutoSize = $true
+    $timeoutLabel.Location = New-Object System.Drawing.Point(20, 210)
+    $timeoutLabel.ForeColor = [System.Drawing.Color]::Gray
+    $form.Controls.Add($timeoutLabel)
+
+    # OK button
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "OK"
+    $okButton.Size = New-Object System.Drawing.Size(75, 30)
+    $okButton.Location = New-Object System.Drawing.Point(205, 240)
+    $okButton.Add_Click({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+    $form.Controls.Add($okButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(75, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(285, 240)
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancelled'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Timer for timeout
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = $TimeoutSeconds * 1000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $form.Tag = 'Timeout'
+        $form.Close()
+    })
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        $timer.Stop()
+        $timer.Dispose()
+        
+        # If Tag is not set (form closed without button click), mark as cancelled
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancelled'
+        }
+    })
+
+    # Handle double-click on list item (same as OK button)
+    $listBox.Add_DoubleClick({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+
+    # Set default button and show
+    $form.AcceptButton = $okButton
+    $form.CancelButton = $cancelButton
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+# Show environment selection dialog
+if (-not (Get-Variable -Name LoginEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
+
+    $selectedEnv = Show-EnvironmentSelectionDialog -TimeoutSeconds 60
+
+    # Handle timeout, cancellation, or no selection
+    if ($selectedEnv -eq 'Timeout' -or $selectedEnv -eq 'Cancelled' -or [string]::IsNullOrWhiteSpace($selectedEnv)) {
+        Write-Host "No environment selected or timeout reached - defaulting to Public" -ForegroundColor Yellow
+        $LoginEnvironment = 'Public'
+    }
+    else {
+        # Extract the environment name from the display text
+        $envName = $selectedEnv -replace ' \(.*\)', ''
+        
+        switch ($envName.Trim()) {
+            'Public'       { $LoginEnvironment = 'Public' ; break }
+            'Germany'      { $LoginEnvironment = 'Germany' ; break }
+            'USGovHigh'    { $LoginEnvironment = 'USGovHigh' ; break }
+            'USGovMil'     { $LoginEnvironment = 'USGovMil' ; break }
+            'USGov'        { $LoginEnvironment = 'USGov' ; break }
+            'China'        { $LoginEnvironment = 'China' ; break }
+            default {
+                Write-Warning "Unrecognized environment '$selectedEnv'. Defaulting to 'Public'."
+                $LoginEnvironment = 'Public'
+            }
+        }
+        
+        Write-Host "[INFO] Selected environment: $LoginEnvironment" -ForegroundColor Green
+    }
+}
+
+# If explicitly 'Public', set to $null for Connect-PowerBIServiceAccount default
+if ($LoginEnvironment -eq 'Public') { 
+    $LoginEnvironment = $null 
+}
+
+# =============================
+# Get Power BI Endpoints
+# =============================
+
+function Get-PowerBIEndpoints {
+    param([string]$Environment)
+    
+    $endpoints = @{
+        ApiPrefix      = 'https://api.powerbi.com'
+        XmlaPrefix     = 'powerbi://api.powerbi.com'
+        WebPrefix      = 'https://app.powerbi.com'
+        ResourceUrl    = 'https://analysis.windows.net/powerbi/api'
+        EmbedUrl       = 'https://app.powerbi.com/reportEmbed'
+        LoginUrl       = 'https://login.microsoftonline.com'
+        FabricApiPrefix = 'https://api.fabric.microsoft.com'
+    }
+    
+    switch ($Environment) {
+        'Germany' {
+            $endpoints.ApiPrefix = 'https://api.powerbi.de'
+            $endpoints.XmlaPrefix = 'powerbi://api.powerbi.de'
+            $endpoints.WebPrefix = 'https://app.powerbi.de'
+            $endpoints.ResourceUrl = 'https://analysis.cloudapi.de/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.powerbi.de/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.com'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.de'
+        }
+        'China' {
+            $endpoints.ApiPrefix = 'https://api.powerbi.cn'
+            $endpoints.XmlaPrefix = 'powerbi://api.powerbi.cn'
+            $endpoints.WebPrefix = 'https://app.powerbi.cn'
+            $endpoints.ResourceUrl = 'https://analysis.chinacloudapi.cn/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.powerbi.cn/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.partner.microsoftonline.cn'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.cn'
+        }
+        'USGov' {
+            $endpoints.ApiPrefix = 'https://api.powerbigov.us'
+            $endpoints.XmlaPrefix = 'powerbi://api.powerbigov.us'
+            $endpoints.WebPrefix = 'https://app.powerbigov.us'
+            $endpoints.ResourceUrl = 'https://analysis.usgovcloudapi.net/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.powerbigov.us/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.com'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.us'
+        }
+        'USGovHigh' {
+            $endpoints.ApiPrefix = 'https://api.high.powerbigov.us'
+            $endpoints.XmlaPrefix = 'powerbi://api.high.powerbigov.us'
+            $endpoints.WebPrefix = 'https://app.high.powerbigov.us'
+            $endpoints.ResourceUrl = 'https://analysis.high.usgovcloudapi.net/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.high.powerbigov.us/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.us'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.high.microsoft.us'
+        }
+        'USGovMil' {
+            $endpoints.ApiPrefix = 'https://api.mil.powerbi.us'
+            $endpoints.XmlaPrefix = 'powerbi://api.mil.powerbi.us'
+            $endpoints.WebPrefix = 'https://app.mil.powerbi.us'
+            $endpoints.ResourceUrl = 'https://analysis.dod.usgovcloudapi.net/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.mil.powerbi.us/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.us'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.mil.microsoft.us'
+        }
+    }
+    
+    return $endpoints
+}
+
+$EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { 'Public' }
+$global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
+
+# =============================
+# Connect to Power BI Service
+# =============================
+
+function Connect-PowerBI {
+    param([string]$Environment)
+
+    if ($Environment) {
+        Connect-PowerBIServiceAccount -Environment $Environment | Out-Null
+    } else {
+        Connect-PowerBIServiceAccount | Out-Null
+    }
+
+    $global:accessTokenObject = Get-PowerBIAccessToken
+    $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
+    Set-Content -Path $env:TEMP\PowerBI_TempAccessToken.txt -Value $global:accessToken
+}
+
+try {
+    Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints"
+    Connect-PowerBI -Environment $LoginEnvironment
+}
+
+Write-Host ""
+
+# =============================
+# Helper Functions
+# =============================
+
+function Get-CurrentAccessToken {
+    try {
+        $accessTokenObject = Get-PowerBIAccessToken
+        $accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
+        return $accessToken
+    }
+    catch {
+        Write-Warning "Failed to get access token: $_"
+        return $null
+    }
+}
+
+function Get-CurrentUserPrincipalName {
+    try {
+        $userUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/users"
+        $usersResponse = Invoke-PowerBIRestMethod -Method GET -Url $userUrl | ConvertFrom-Json
+        
+        if ($usersResponse -and $usersResponse.value -and $usersResponse.value.Count -gt 0) {
+            return $usersResponse.value[0].emailAddress
+        }
+    }
+    catch {
+        Write-Warning "Failed to get user principal name via API"
+    }
+    
+    # Alternative: try to extract from the access token
+    try {
+        $token = Get-CurrentAccessToken
+        $tokenParts = $token.Split('.')
+        if ($tokenParts.Length -ge 2) {
+            $payload = $tokenParts[1]
+            while ($payload.Length % 4 -ne 0) { $payload += '=' }
+            $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+            $payloadObj = $decoded | ConvertFrom-Json
+            
+            if ($payloadObj.upn) {
+                return $payloadObj.upn
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed to extract user from token"
+    }
+    
+    Write-Warning "Could not determine current user principal name"
+    return $null
+}
+
+function Get-WabiEndpoint {
+    $capacitiesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/capacities"
+    $response = Invoke-PowerBIRestMethod -Method GET -Url $capacitiesUrl | ConvertFrom-Json
+
+    $odataContext = $response.'@odata.context'
+
+    if (-not $odataContext) {
+        throw "Unable to determine WABI endpoint: '@odata.context' not found."
+    }
+
+    if ($odataContext -match '^(https://[^/]+)') {
+        return $matches[1]
+    }
+
+    throw "Failed to parse WABI endpoint from: $odataContext"
+}
+
+# =============================
+# Permission Management Functions
+# =============================
+
+function Add-UserAsWorkspaceAdmin {
+    param(
+        [string]$WorkspaceId,
+        [string]$PrincipalIdentifier,
+        [string]$AccessRight = "Admin",
+        [string]$WorkspaceType,
+        [string]$PrincipalType = "User"
+    )
+    
+    # Personal and PersonalGroup workspaces cannot be updated via supported APIs
+    if ($WorkspaceType -eq "Personal" -or $WorkspaceType -eq "PersonalGroup") {
+        Write-Warning "Skipping permission changes for Personal or PersonalGroup workspace $WorkspaceId (unsupported)."
+        return $false
+    }
+    
+    # Use admin endpoint for adding principals to regular workspaces
+    $addUserUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$WorkspaceId/users"
+    
+    $body = @{
+        identifier = $PrincipalIdentifier
+        groupUserAccessRight = $AccessRight
+        principalType = $PrincipalType
+    } | ConvertTo-Json
+    
+    try {
+        $accessToken = Get-CurrentAccessToken
+        $headers = @{
+            'Authorization' = "Bearer $accessToken"
+            'Content-Type' = 'application/json'
+        }
+        
+        Invoke-RestMethod -Uri $addUserUrl -Headers $headers -Method POST -Body $body | Out-Null
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Remove-UserFromWorkspace {
+    param(
+        [string]$WorkspaceId,
+        [string]$PrincipalIdentifier,
+        [string]$WorkspaceType,
+        [string]$PrincipalType = "User"
+    )
+    
+    # Personal and PersonalGroup workspaces cannot be updated via supported APIs
+    if ($WorkspaceType -eq "Personal" -or $WorkspaceType -eq "PersonalGroup") {
+        Write-Warning "Skipping permission removal for Personal or PersonalGroup workspace $WorkspaceId (unsupported)."
+        return $false
+    }
+    
+    # Use admin endpoint for removing principals from regular workspaces
+    # Add ?isGroup=True query parameter for Group principal types (required for deletion)
+    $removeUserUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$WorkspaceId/users/$PrincipalIdentifier"
+    if ($PrincipalType -eq 'Group') {
+        $removeUserUrl += "?isGroup=True"
+    }
+    
+    try {
+        $accessToken = Get-CurrentAccessToken
+        $headers = @{
+            'Authorization' = "Bearer $accessToken"
+            'Content-Type' = 'application/json'
+        }
+        
+        Invoke-RestMethod -Uri $removeUserUrl -Headers $headers -Method DELETE | Out-Null
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# =============================
+# Principal Type Selection Dialog
+# =============================
+
+function Show-PrincipalTypeSelectionDialog {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Principal Type"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(500, 350)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Label
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Who do you want to add/remove permissions for?"
+    $label.AutoSize = $false
+    $label.Size = New-Object System.Drawing.Size(460, 40)
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $label.TextAlign = 'MiddleCenter'
+    $label.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($label)
+
+    # Current User button
+    $currentUserButton = New-Object System.Windows.Forms.Button
+    $currentUserButton.Text = "Current User (Myself)"
+    $currentUserButton.Size = New-Object System.Drawing.Size(200, 50)
+    $currentUserButton.Location = New-Object System.Drawing.Point(150, 70)
+    $currentUserButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $currentUserButton.Add_Click({
+        $form.Tag = @{Type='User'; Mode='Current'}
+        $form.Close()
+    })
+    $form.Controls.Add($currentUserButton)
+
+    # Service Principal button
+    $spnButton = New-Object System.Windows.Forms.Button
+    $spnButton.Text = "Service Principal (SPN)"
+    $spnButton.Size = New-Object System.Drawing.Size(200, 50)
+    $spnButton.Location = New-Object System.Drawing.Point(150, 130)
+    $spnButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $spnButton.Add_Click({
+        $form.Tag = @{Type='App'; Mode='Input'}
+        $form.Close()
+    })
+    $form.Controls.Add($spnButton)
+
+    # Security Group button
+    $groupButton = New-Object System.Windows.Forms.Button
+    $groupButton.Text = "Security Group"
+    $groupButton.Size = New-Object System.Drawing.Size(200, 50)
+    $groupButton.Location = New-Object System.Drawing.Point(150, 190)
+    $groupButton.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $groupButton.Add_Click({
+        $form.Tag = @{Type='Group'; Mode='Input'}
+        $form.Close()
+    })
+    $form.Controls.Add($groupButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(100, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(200, 250)
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancel'
+        }
+    })
+
+    $form.CancelButton = $cancelButton
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+# =============================
+# Action Selection Dialog
+# =============================
+
+function Show-ActionSelectionDialog {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Action"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(500, 300)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Label
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Do you want to add or remove workspace permissions?"
+    $label.AutoSize = $false
+    $label.Size = New-Object System.Drawing.Size(460, 40)
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $label.TextAlign = 'MiddleCenter'
+    $label.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($label)
+
+    # Add Permissions button
+    $addButton = New-Object System.Windows.Forms.Button
+    $addButton.Text = "Add Permissions"
+    $addButton.Size = New-Object System.Drawing.Size(180, 60)
+    $addButton.Location = New-Object System.Drawing.Point(50, 80)
+    $addButton.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $addButton.Add_Click({
+        $form.Tag = 'Add'
+        $form.Close()
+    })
+    $form.Controls.Add($addButton)
+
+    # Remove Permissions button
+    $removeButton = New-Object System.Windows.Forms.Button
+    $removeButton.Text = "Remove Permissions"
+    $removeButton.Size = New-Object System.Drawing.Size(180, 60)
+    $removeButton.Location = New-Object System.Drawing.Point(260, 80)
+    $removeButton.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $removeButton.Add_Click({
+        $form.Tag = 'Remove'
+        $form.Close()
+    })
+    $form.Controls.Add($removeButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(100, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(190, 160)
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancel'
+        }
+    })
+
+    $form.CancelButton = $cancelButton
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+# =============================
+# Workspace Selection Dialog
+# =============================
+
+function Show-WorkspaceSelectionDialog {
+    param(
+        [Parameter(Mandatory=$true)]
+        [array]$Workspaces,
+        [Parameter(Mandatory=$true)]
+        [string]$Title,
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        [Parameter(Mandatory=$false)]
+        [string]$WarningMessage
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    # Calculate warning label height upfront (label height + spacing)
+    $warningLabelActualHeight = 50
+    $warningLabelSpacing = 5
+    $warningLabelHeight = if ($WarningMessage) { $warningLabelActualHeight + $warningLabelSpacing } else { 0 }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Title
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(700, (600 + $warningLabelHeight))
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Message label
+    $messageLabel = New-Object System.Windows.Forms.Label
+    $messageLabel.Text = $Message
+    $messageLabel.AutoSize = $false
+    $messageLabel.Size = New-Object System.Drawing.Size(660, 40)
+    $messageLabel.Location = New-Object System.Drawing.Point(20, 20)
+    $messageLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $form.Controls.Add($messageLabel)
+
+    # Warning label (if provided)
+    if ($WarningMessage) {
+        $warningBackColor = [System.Drawing.Color]::FromArgb(255, 255, 240, 200)  # Light orange
+        $warningForeColor = [System.Drawing.Color]::Red
+
+        $warningLabel = New-Object System.Windows.Forms.Label
+        $warningLabel.Text = $WarningMessage
+        $warningLabel.AutoSize = $false
+        $warningLabel.Size = New-Object System.Drawing.Size(660, $warningLabelActualHeight)
+        $warningLabel.Location = New-Object System.Drawing.Point(20, 65)
+        $warningLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+        $warningLabel.ForeColor = $warningForeColor
+        $warningLabel.BackColor = $warningBackColor
+        $warningLabel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        $warningLabel.Padding = New-Object System.Windows.Forms.Padding(5)
+        $warningLabel.TextAlign = 'MiddleLeft'
+        $form.Controls.Add($warningLabel)
+    }
+
+    # Search box label
+    $searchLabel = New-Object System.Windows.Forms.Label
+    $searchLabel.Text = "Search:"
+    $searchLabel.AutoSize = $true
+    $searchLabel.Location = New-Object System.Drawing.Point(20, (70 + $warningLabelHeight))
+    $searchLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $form.Controls.Add($searchLabel)
+
+    # Search TextBox
+    $searchBox = New-Object System.Windows.Forms.TextBox
+    $searchBox.Location = New-Object System.Drawing.Point(75, (68 + $warningLabelHeight))
+    $searchBox.Size = New-Object System.Drawing.Size(585, 20)
+    $searchBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $form.Controls.Add($searchBox)
+
+    # CheckedListBox for workspace selection
+    $checkedListBox = New-Object System.Windows.Forms.CheckedListBox
+    $checkedListBox.Location = New-Object System.Drawing.Point(20, (100 + $warningLabelHeight))
+    $checkedListBox.Size = New-Object System.Drawing.Size(640, 350)
+    $checkedListBox.CheckOnClick = $true
+    $checkedListBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+    
+    # Sort workspaces alphabetically by name
+    $sortedWorkspaces = $Workspaces | Sort-Object -Property name
+    
+    # IMPORTANT: keep selection mapping aligned
+    $Workspaces = $sortedWorkspaces
+    
+    # Store all workspaces with their display text
+    $script:allWorkspaceItems = @()
+    foreach ($workspace in $sortedWorkspaces) {
+        $workspaceName = $workspace.name
+        $workspaceId = $workspace.id
+        $workspaceType = if ($workspace.type) { " [$($workspace.type)]" } else { "" }
+        $displayText = "$workspaceName$workspaceType ($workspaceId)"
+        $script:allWorkspaceItems += @{
+            DisplayText = $displayText
+            Workspace = $workspace
+            Checked = $false
+        }
+    }
+    
+    # Helper function to find index by display text
+    $script:FindItemIndex = {
+        param($displayText)
+        for ($i = 0; $i -lt $script:allWorkspaceItems.Count; $i++) {
+            if ($script:allWorkspaceItems[$i].DisplayText -eq $displayText) {
+                return $i
+            }
+        }
+        return -1
+    }
+    
+    # Function to filter and populate the checkedListBox based on search text
+    $script:UpdateWorkspaceList = {
+        param($searchText)
+        
+        # Store the current checked states before clearing
+        for ($i = 0; $i -lt $checkedListBox.Items.Count; $i++) {
+            $itemText = $checkedListBox.Items[$i]
+            $itemIndex = & $script:FindItemIndex $itemText
+            if ($itemIndex -ge 0) {
+                $script:allWorkspaceItems[$itemIndex].Checked = $checkedListBox.GetItemChecked($i)
+            }
+        }
+        
+        # Clear and repopulate based on filter
+        $checkedListBox.Items.Clear()
+        
+        for ($i = 0; $i -lt $script:allWorkspaceItems.Count; $i++) {
+            $item = $script:allWorkspaceItems[$i]
+            # Use case-insensitive contains for simple substring matching
+            if ([string]::IsNullOrWhiteSpace($searchText) -or $item.DisplayText.ToLower().Contains($searchText.ToLower())) {
+                $index = $checkedListBox.Items.Add($item.DisplayText)
+                $checkedListBox.SetItemChecked($index, $item.Checked)
+            }
+        }
+    }
+    
+    # Initial population
+    & $script:UpdateWorkspaceList ""
+    
+    # Add TextChanged event for search functionality
+    $searchBox.Add_TextChanged({
+        & $script:UpdateWorkspaceList $searchBox.Text
+    })
+
+    
+    $form.Controls.Add($checkedListBox)
+
+    # Select All checkbox
+    $selectAllCheckBox = New-Object System.Windows.Forms.CheckBox
+    $selectAllCheckBox.Text = "Select All / Deselect All"
+    $selectAllCheckBox.AutoSize = $true
+    $selectAllCheckBox.Location = New-Object System.Drawing.Point(20, (460 + $warningLabelHeight))
+    $selectAllCheckBox.Add_CheckedChanged({
+        # Update both the UI and the underlying data
+        for ($i = 0; $i -lt $checkedListBox.Items.Count; $i++) {
+            $checkedListBox.SetItemChecked($i, $selectAllCheckBox.Checked)
+            
+            # Also update the underlying allWorkspaceItems array
+            $itemText = $checkedListBox.Items[$i]
+            $itemIndex = & $script:FindItemIndex $itemText
+            if ($itemIndex -ge 0) {
+                $script:allWorkspaceItems[$itemIndex].Checked = $selectAllCheckBox.Checked
+            }
+        }
+        
+        # Update the count label
+        $totalChecked = ($script:allWorkspaceItems | Where-Object { $_.Checked }).Count
+        $visibleChecked = if ($selectAllCheckBox.Checked) { $checkedListBox.Items.Count } else { 0 }
+        $countLabel.Text = "Total: $($Workspaces.Count) workspace(s) - Showing: $($checkedListBox.Items.Count) - $visibleChecked selected (of $totalChecked total selected)"
+    })
+    $form.Controls.Add($selectAllCheckBox)
+
+    # Count label
+    $countLabel = New-Object System.Windows.Forms.Label
+    $countLabel.Text = "Total: $($Workspaces.Count) workspace(s) - Showing: $($Workspaces.Count) - 0 selected"
+    $countLabel.AutoSize = $true
+    $countLabel.Location = New-Object System.Drawing.Point(20, (490 + $warningLabelHeight))
+    $countLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $form.Controls.Add($countLabel)
+
+    # Update count when selection changes
+    $checkedListBox.Add_ItemCheck({
+        param($sender, $e)
+        $form.BeginInvoke([Action]{
+            # Update the checked state in allWorkspaceItems
+            $itemText = $checkedListBox.Items[$e.Index]
+            $itemIndex = & $script:FindItemIndex $itemText
+            if ($itemIndex -ge 0) {
+                $script:allWorkspaceItems[$itemIndex].Checked = ($e.NewValue -eq 'Checked')
+            }
+            
+            # Count total checked items across all workspaces (not just visible)
+            $totalChecked = ($script:allWorkspaceItems | Where-Object { $_.Checked }).Count
+            $visibleChecked = $checkedListBox.CheckedItems.Count
+            $countLabel.Text = "Total: $($Workspaces.Count) workspace(s) - Showing: $($checkedListBox.Items.Count) - $visibleChecked selected (of $totalChecked total selected)"
+        })
+    })
+
+    # OK button
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "OK"
+    $okButton.Size = New-Object System.Drawing.Size(100, 30)
+    $okButton.Location = New-Object System.Drawing.Point(450, (520 + $warningLabelHeight))
+    $okButton.Add_Click({
+        # Update checked states for currently visible items before checking
+        for ($i = 0; $i -lt $checkedListBox.Items.Count; $i++) {
+            $itemText = $checkedListBox.Items[$i]
+            $itemIndex = & $script:FindItemIndex $itemText
+            if ($itemIndex -ge 0) {
+                $script:allWorkspaceItems[$itemIndex].Checked = $checkedListBox.GetItemChecked($i)
+            }
+        }
+        
+        $totalChecked = ($script:allWorkspaceItems | Where-Object { $_.Checked }).Count
+        if ($totalChecked -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Please select at least one workspace.",
+                "No Workspaces Selected",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+        $form.Tag = 'OK'
+        $form.Close()
+    })
+    $form.Controls.Add($okButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(100, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(560, (520 + $warningLabelHeight))
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancel'
+        }
+    })
+
+    $form.AcceptButton = $okButton
+    $form.CancelButton = $cancelButton
+    [void]$form.ShowDialog()
+
+    # Return selected workspace IDs (not indices to avoid sorting mismatch)
+    if ($form.Tag -eq 'OK') {
+        # Final update of checked states
+        for ($i = 0; $i -lt $checkedListBox.Items.Count; $i++) {
+            $itemText = $checkedListBox.Items[$i]
+            $itemIndex = & $script:FindItemIndex $itemText
+            if ($itemIndex -ge 0) {
+                $script:allWorkspaceItems[$itemIndex].Checked = $checkedListBox.GetItemChecked($i)
+            }
+        }
+        
+        # Return workspace IDs of checked items (not indices)
+        $selectedWorkspaceIds = @()
+        for ($i = 0; $i -lt $script:allWorkspaceItems.Count; $i++) {
+            if ($script:allWorkspaceItems[$i].Checked) {
+                $selectedWorkspaceIds += $script:allWorkspaceItems[$i].Workspace.id
+            }
+        }
+        return $selectedWorkspaceIds
+    }
+    else {
+        return $null
+    }
+}
+
+# =============================
+# Main Script Logic
+# =============================
+
+# Show action selection dialog
+$action = Show-ActionSelectionDialog
+
+if ($action -eq 'Cancel') {
+    Write-Host "[INFO] Operation cancelled by user."
+    exit
+}
+
+Write-Host "[INFO] Selected action: $action permissions"
+Write-Host ""
+
+# Show principal type selection dialog
+$principalSelection = Show-PrincipalTypeSelectionDialog
+
+if ($principalSelection -eq 'Cancel') {
+    Write-Host "[INFO] Operation cancelled by user."
+    exit
+}
+
+$principalType = $principalSelection.Type
+$principalMode = $principalSelection.Mode
+
+Write-Host "[INFO] Selected principal type: $principalType"
+Write-Host ""
+
+# Get principal identifier based on selection
+if ($principalMode -eq 'Current') {
+    # Get current user
+    $principalIdentifier = Get-CurrentUserPrincipalName
+    
+    if (-not $principalIdentifier) {
+        Write-Host "[ERROR] Could not determine current user. Exiting." -ForegroundColor Red
+        exit
+    }
+    
+    Write-Host "[INFO] Current user: $principalIdentifier"
+} else {
+    # Prompt for principal identifier using Windows Forms dialog
+    $promptMessage = switch ($principalType) {
+        'App'   { "Enter Service Principal Object ID:" }
+        'Group' { "Enter Security Group Object ID:" }
+        default { "Enter User Email:" }
+    }
+    
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $inputForm = New-Object System.Windows.Forms.Form
+    $inputForm.Text = "Enter $principalType Identifier"
+    $inputForm.StartPosition = 'CenterScreen'
+    $inputForm.Size = New-Object System.Drawing.Size(400, 180)
+    $inputForm.TopMost = $true
+    $inputForm.FormBorderStyle = 'FixedDialog'
+    $inputForm.MaximizeBox = $false
+
+    $promptLabel = New-Object System.Windows.Forms.Label
+    $promptLabel.Text = $promptMessage
+    $promptLabel.AutoSize = $true
+    $promptLabel.Location = New-Object System.Drawing.Point(20, 20)
+    $inputForm.Controls.Add($promptLabel)
+
+    $inputTextBox = New-Object System.Windows.Forms.TextBox
+    $inputTextBox.Location = New-Object System.Drawing.Point(20, 50)
+    $inputTextBox.Size = New-Object System.Drawing.Size(340, 20)
+    $inputForm.Controls.Add($inputTextBox)
+
+    $okBtn = New-Object System.Windows.Forms.Button
+    $okBtn.Text = "OK"
+    $okBtn.Width = 100
+    $okBtn.Location = New-Object System.Drawing.Point(170, 90)
+    $okBtn.Add_Click({
+        $inputForm.Tag = $inputTextBox.Text
+        $inputForm.Close()
+    })
+    $inputForm.Controls.Add($okBtn)
+
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = "Cancel"
+    $cancelBtn.Width = 100
+    $cancelBtn.Location = New-Object System.Drawing.Point(280, 90)
+    $cancelBtn.Add_Click({
+        $inputForm.Tag = $null
+        $inputForm.Close()
+    })
+    $inputForm.Controls.Add($cancelBtn)
+
+    $inputForm.AcceptButton = $okBtn
+    $inputForm.CancelButton = $cancelBtn
+    [void]$inputForm.ShowDialog()
+
+    $principalIdentifier = $inputForm.Tag
+    
+    if ([string]::IsNullOrWhiteSpace($principalIdentifier)) {
+        Write-Host "[INFO] Operation cancelled by user."
+        exit
+    }
+    
+    Write-Host "[INFO] Principal identifier: $principalIdentifier"
+}
+
+Write-Host ""
+
+# Fetch all workspaces using Admin API with pagination
+Write-Host "[INFO] Fetching workspace list from Power BI..."
+
+try {
+    $allWorkspaces = @()
+    $continuationToken = $null
+    
+    do {
+        $adminWorkspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups?`$top=1000"
+        if ($continuationToken) {
+            $adminWorkspacesUrl += "&continuationToken=$continuationToken"
+        }
+        
+        $adminWorkspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $adminWorkspacesUrl | ConvertFrom-Json
+        $allWorkspaces += $adminWorkspacesResponse.value
+        
+        # Check for continuation token in response
+        $continuationToken = $adminWorkspacesResponse.continuationToken
+        
+    } while ($continuationToken)
+    
+    Write-Host "[INFO] Found $($allWorkspaces.Count) total workspace(s) in tenant"
+}
+catch {
+    Write-Host "[ERROR] Failed to fetch workspaces using Admin API. You need Tenant Admin permissions." -ForegroundColor Red
+    Write-Host "Error: $_" -ForegroundColor Red
+    exit
+}
+
+# Fetch workspaces the user has access to (only for current user)
+$userWorkspaceIds = @()
+if ($principalType -eq 'User' -and $principalMode -eq 'Current') {
+    Write-Host "[INFO] Fetching workspaces you have access to..."
+    
+    try {
+        $userWorkspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
+        $userWorkspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $userWorkspacesUrl | ConvertFrom-Json
+        $userWorkspaceIds = @($userWorkspacesResponse.value.id)
+        
+        Write-Host "[INFO] You have access to $($userWorkspaceIds.Count) workspace(s) via regular API"
+    }
+    catch {
+        Write-Host "[WARNING] Failed to fetch user workspaces. Assuming no direct access." -ForegroundColor Yellow
+        $userWorkspaceIds = @()
+    }
+    
+    Write-Host "[INFO] Total accessible workspaces: $($userWorkspaceIds.Count)"
+    Write-Host ""
+}
+
+# Filter workspaces based on action
+$accessCheckMessage = "[INFO] Showing all workspaces (access check not available for $principalType)"
+
+if ($action -eq 'Add') {
+    # Show workspaces where the principal does NOT have access
+    # For User principal, filter based on actual access
+    if ($principalType -eq 'User' -and $principalMode -eq 'Current') {
+        $filteredWorkspaces = $allWorkspaces | Where-Object { $userWorkspaceIds -notcontains $_.id }
+    } else {
+        # For App and Group, or manually entered users, show all workspaces (we can't easily determine existing access)
+        Write-Host $accessCheckMessage
+        $filteredWorkspaces = $allWorkspaces
+    }
+    
+    if ($filteredWorkspaces.Count -eq 0) {
+        Write-Host "[INFO] No workspaces available for adding permissions." -ForegroundColor Green
+        exit
+    }
+    
+    Write-Host "[INFO] Found $($filteredWorkspaces.Count) workspace(s) available"
+    
+    $selectedWorkspaceIds = Show-WorkspaceSelectionDialog `
+        -Workspaces $filteredWorkspaces `
+        -Title "Add Workspace Permissions" `
+        -Message "Select workspaces to add $principalType as Admin:"
+    
+    if ($null -eq $selectedWorkspaceIds) {
+        Write-Host "[INFO] Operation cancelled by user."
+        exit
+    }
+    
+    # Add permissions to selected workspaces
+    Write-Host ""
+    Write-Host "[INFO] Adding permissions to selected workspace(s)..."
+    Write-Host ""
+    
+    $successCount = 0
+    $failureCount = 0
+    
+    foreach ($workspaceId in $selectedWorkspaceIds) {
+        $workspace = $filteredWorkspaces | Where-Object { $_.id -eq $workspaceId }
+        $workspaceName = $workspace.name
+        $workspaceType = if ($workspace.type) { $workspace.type } else { "Workspace" }
+        
+        Write-Host "[PROCESSING] $workspaceName ($workspaceId)"
+
+        if ($workspaceType -eq "Personal" -or $workspaceType -eq "PersonalGroup") {
+            Write-Host "[INFO] Skipping $workspaceType workspace (permission changes unsupported): $workspaceName"
+            continue
+        }
+        
+        $success = Add-UserAsWorkspaceAdmin -WorkspaceId $workspaceId `
+                                             -PrincipalIdentifier $principalIdentifier `
+                                             -AccessRight "Admin" `
+                                             -WorkspaceType $workspaceType `
+                                             -PrincipalType $principalType
+        
+        if ($success) {
+            Write-Host "[SUCCESS] Added permissions to: $workspaceName" -ForegroundColor Green
+            $successCount++
+        } else {
+            Write-Host "[FAILED] Could not add permissions to: $workspaceName" -ForegroundColor Red
+            $failureCount++
+        }
+        
+        Write-Host ""
+    }
+    
+    # Summary
+    Write-Host "======================================"
+    Write-Host "Add Permissions Summary"
+    Write-Host "======================================"
+    Write-Host ""
+    Write-Host "Total workspaces selected:   $($selectedWorkspaceIds.Count)"
+    Write-Host "Successfully added:          $successCount" -ForegroundColor Green
+    Write-Host "Failed:                      $failureCount" -ForegroundColor $(if ($failureCount -gt 0) { "Red" } else { "White" })
+    Write-Host ""
+}
+elseif ($action -eq 'Remove') {
+    # Show workspaces where the principal DOES have access
+    # For User principal, filter based on actual access
+    if ($principalType -eq 'User' -and $principalMode -eq 'Current') {
+        $filteredWorkspaces = $allWorkspaces | Where-Object { $userWorkspaceIds -contains $_.id }
+    } else {
+        # For App and Group, or manually entered users, show all workspaces (we can't easily determine existing access)
+        Write-Host $accessCheckMessage
+        $filteredWorkspaces = $allWorkspaces
+    }
+    
+    if ($filteredWorkspaces.Count -eq 0) {
+        Write-Host "[INFO] No workspaces available for removing permissions." -ForegroundColor Green
+        exit
+    }
+    
+    Write-Host "[INFO] Found $($filteredWorkspaces.Count) workspace(s) available"
+    
+    $selectedWorkspaceIds = Show-WorkspaceSelectionDialog `
+        -Workspaces $filteredWorkspaces `
+        -Title "Remove Workspace Permissions" `
+        -Message "Select workspaces to remove $principalType from:" `
+        -WarningMessage "Personal and PersonalGroup workspaces are unsupported and will be skipped."
+    
+    if ($null -eq $selectedWorkspaceIds) {
+        Write-Host "[INFO] Operation cancelled by user."
+        exit
+    }
+    
+    # Remove permissions from selected workspaces
+    Write-Host ""
+    Write-Host "[INFO] Removing permissions from selected workspace(s)..."
+    Write-Host ""
+    
+    $successCount = 0
+    $failureCount = 0
+    
+    foreach ($workspaceId in $selectedWorkspaceIds) {
+        $workspace = $filteredWorkspaces | Where-Object { $_.id -eq $workspaceId }
+        $workspaceName = $workspace.name
+        $workspaceType = if ($workspace.type) { $workspace.type } else { "Workspace" }
+        
+        Write-Host "[PROCESSING] $workspaceName ($workspaceId)"
+
+        if ($workspaceType -eq "Personal" -or $workspaceType -eq "PersonalGroup") {
+            Write-Host "[INFO] Skipping $workspaceType workspace (permission changes unsupported): $workspaceName"
+            continue
+        }
+        
+        $success = Remove-UserFromWorkspace -WorkspaceId $workspaceId `
+                                             -PrincipalIdentifier $principalIdentifier `
+                                             -WorkspaceType $workspaceType `
+                                             -PrincipalType $principalType
+        
+        if ($success) {
+            Write-Host "[SUCCESS] Removed permissions from: $workspaceName" -ForegroundColor Green
+            $successCount++
+        } else {
+            Write-Host "[FAILED] Could not remove permissions from: $workspaceName" -ForegroundColor Red
+            $failureCount++
+        }
+        
+        Write-Host ""
+    }
+    
+    # Summary
+    Write-Host "======================================"
+    Write-Host "Remove Permissions Summary"
+    Write-Host "======================================"
+    Write-Host ""
+    Write-Host "Total workspaces selected:   $($selectedWorkspaceIds.Count)"
+    Write-Host "Successfully removed:        $successCount" -ForegroundColor Green
+    Write-Host "Failed:                      $failureCount" -ForegroundColor $(if ($failureCount -gt 0) { "Red" } else { "White" })
+    Write-Host ""
+}
+
+Write-Host "[INFO] Permission management completed"

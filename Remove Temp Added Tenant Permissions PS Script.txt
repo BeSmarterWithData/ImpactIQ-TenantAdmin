@@ -1,0 +1,784 @@
+$BaseFolderPath = "C:\Power BI Backups"
+$AuditFileName = "Tenant Permission Workspace List.xlsx"
+
+# =============================
+# Service Principal Configuration (Optional)
+# =============================
+
+# OPTIONAL: Configure Service Principal App and Security Group to also remove their permissions
+# Leave blank to skip
+$AppObjectId = ""                                        # Service Principal Object ID (GUID)
+$ServicePrincipalSecurityGroupIdentifier = ""            # Security Group Object ID (GUID) or UPN
+
+
+$ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
+
+# Temporarily set execution policy to Bypass for this session
+if ((Get-ExecutionPolicy) -ne 'Bypass') {
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+}
+
+Write-Host ""
+Write-Host "======================================"
+Write-Host "Tenant Permission Cleanup Script"
+Write-Host "======================================"
+Write-Host ""
+
+# =============================
+# Check Required Modules
+# =============================
+
+# Ensure required modules are installed, and imports them. If import fails, error and exit early
+$requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt' )
+foreach ($module in $requiredModules) {
+    if( -not (Import-Module $module -PassThru -EA ignore) ) {
+       Install-Module -Name $module -Scope CurrentUser -Force
+    }
+
+    Import-Module $Module -ErrorAction 'stop' # In the rare case Install-Module fails, you probably want a terminating error
+}
+
+# =============================
+# Check Audit File Exists
+# =============================
+
+$auditFilePath = Join-Path -Path $BaseFolderPath -ChildPath $AuditFileName
+
+Write-Host "[INFO] Found audit file: $auditFilePath"
+
+# =============================
+# Environment Selection Dialog
+# =============================
+
+function Show-EnvironmentSelectionDialog {
+    param(
+        [int]$TimeoutSeconds = 60
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Power BI Environment"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(400, 320)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Label
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Select your Power BI cloud environment:"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $form.Controls.Add($label)
+
+    # ListBox for environment selection
+    $listBox = New-Object System.Windows.Forms.ListBox
+    $listBox.Location = New-Object System.Drawing.Point(20, 50)
+    $listBox.Size = New-Object System.Drawing.Size(340, 150)
+    $listBox.SelectionMode = 'One'
+    
+    # Add environment options
+    $environments = @(
+        'Public (Commercial)',
+        'Germany',
+        'USGov',
+        'China',
+        'USGovHigh',
+        'USGovMil'
+    )
+    
+    foreach ($env in $environments) {
+        [void]$listBox.Items.Add($env)
+    }
+    
+    # Set default selection to Public
+    $listBox.SelectedIndex = 0
+    $form.Controls.Add($listBox)
+
+    # Timeout label
+    $timeoutLabel = New-Object System.Windows.Forms.Label
+    $timeoutLabel.Text = "Timeout in $TimeoutSeconds seconds (defaults to Public)"
+    $timeoutLabel.AutoSize = $true
+    $timeoutLabel.Location = New-Object System.Drawing.Point(20, 210)
+    $timeoutLabel.ForeColor = [System.Drawing.Color]::Gray
+    $form.Controls.Add($timeoutLabel)
+
+    # OK button
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "OK"
+    $okButton.Size = New-Object System.Drawing.Size(75, 30)
+    $okButton.Location = New-Object System.Drawing.Point(205, 240)
+    $okButton.Add_Click({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+    $form.Controls.Add($okButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(75, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(285, 240)
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancelled'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Timer for timeout
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = $TimeoutSeconds * 1000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $form.Tag = 'Timeout'
+        $form.Close()
+    })
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        $timer.Stop()
+        $timer.Dispose()
+        
+        # If Tag is not set (form closed without button click), mark as cancelled
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancelled'
+        }
+    })
+
+    # Handle double-click on list item (same as OK button)
+    $listBox.Add_DoubleClick({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+
+    # Set default button and show
+    $form.AcceptButton = $okButton
+    $form.CancelButton = $cancelButton
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+# Show environment selection dialog
+if (-not (Get-Variable -Name LoginEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
+
+    $selectedEnv = Show-EnvironmentSelectionDialog -TimeoutSeconds 60
+
+    # Handle timeout, cancellation, or no selection
+    if ($selectedEnv -eq 'Timeout' -or $selectedEnv -eq 'Cancelled' -or [string]::IsNullOrWhiteSpace($selectedEnv)) {
+        Write-Host "No environment selected or timeout reached - defaulting to Public" -ForegroundColor Yellow
+        $LoginEnvironment = 'Public'
+    }
+    else {
+        # Extract the environment name from the display text
+        # The format is "EnvironmentName" or "EnvironmentName (Description)"
+        $envName = $selectedEnv -replace ' \(.*\)', ''
+        
+        switch ($envName.Trim()) {
+            'Public'       { $LoginEnvironment = 'Public' ; break }
+            'Germany'      { $LoginEnvironment = 'Germany' ; break }
+            'USGovHigh'    { $LoginEnvironment = 'USGovHigh' ; break }
+            'USGovMil'     { $LoginEnvironment = 'USGovMil' ; break }
+            'USGov'        { $LoginEnvironment = 'USGov' ; break }
+            'China'        { $LoginEnvironment = 'China' ; break }
+            default {
+                Write-Warning "Unrecognized environment '$selectedEnv'. Defaulting to 'Public'."
+                $LoginEnvironment = 'Public'
+            }
+        }
+        
+        Write-Host "[INFO] Selected environment: $LoginEnvironment" -ForegroundColor Green
+    }
+}
+
+# If explicitly 'Public', set to $null for Connect-PowerBIServiceAccount default
+if ($LoginEnvironment -eq 'Public') { 
+    $LoginEnvironment = $null 
+}
+
+# Connect to the Power BI Service
+function Connect-PowerBI {
+    param(
+        [string]$Environment
+    )
+
+    if ($Environment) {
+        Connect-PowerBIServiceAccount -Environment $Environment | Out-Null
+    } else {
+        Connect-PowerBIServiceAccount | Out-Null
+    }
+
+    $global:accessTokenObject = Get-PowerBIAccessToken
+    $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
+    # Write the access token to a temporary file
+    Set-Content -Path $env:TEMP\PowerBI_TempAccessToken.txt -Value $global:accessToken
+}
+
+# Track script start time
+$scriptStartTime = Get-Date
+
+try {
+    Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop | Out-Null
+}
+catch {
+    # First attempt is expected to fail due to MSAL interaction with window pop-up. Second attempt will succeed.
+    Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints"
+    Connect-PowerBI -Environment $LoginEnvironment
+}
+
+Write-Host ""
+
+# =============================
+# Get Power BI Endpoints
+# =============================
+
+function Get-PowerBIEndpoints {
+    param([string]$Environment)
+    
+    $endpoints = switch ($Environment) {
+        'Germany' {
+            @{
+                ApiPrefix = 'https://api.powerbi.de'
+                XmlaPrefix = 'powerbi://api.powerbi.de'
+                WebPrefix = 'https://app.powerbi.de'
+            }
+        }
+        'USGov' {
+            @{
+                ApiPrefix = 'https://api.powerbigov.us'
+                XmlaPrefix = 'powerbi://api.powerbigov.us'
+                WebPrefix = 'https://app.powerbigov.us'
+            }
+        }
+        'China' {
+            @{
+                ApiPrefix = 'https://api.powerbi.cn'
+                XmlaPrefix = 'powerbi://api.powerbi.cn'
+                WebPrefix = 'https://app.powerbi.cn'
+            }
+        }
+        'USGovHigh' {
+            @{
+                ApiPrefix = 'https://api.high.powerbigov.us'
+                XmlaPrefix = 'powerbi://api.high.powerbigov.us'
+                WebPrefix = 'https://app.high.powerbigov.us'
+            }
+        }
+        'USGovMil' {
+            @{
+                ApiPrefix = 'https://api.mil.powerbi.us'
+                XmlaPrefix = 'powerbi://api.mil.powerbi.us'
+                WebPrefix = 'https://app.mil.powerbi.us'
+            }
+        }
+        default {
+            @{
+                ApiPrefix = 'https://api.powerbi.com'
+                XmlaPrefix = 'powerbi://api.powerbi.com'
+                WebPrefix = 'https://app.powerbi.com'
+            }
+        }
+    }
+    
+    return [PSCustomObject]$endpoints
+}
+
+$global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $LoginEnvironment
+
+# =============================
+# Function to determine the WABI region endpoint
+# =============================
+
+function Get-WabiEndpoint {
+    # Call Admin Capacities API using environment-specific endpoint
+    $capacitiesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/capacities"
+    $response = Invoke-PowerBIRestMethod `
+        -Method GET `
+        -Url $capacitiesUrl |
+        ConvertFrom-Json
+
+    # Extract @odata.context
+    $odataContext = $response.'@odata.context'
+
+    if (-not $odataContext) {
+        throw "Unable to determine WABI endpoint: '@odata.context' not found."
+    }
+
+    # Extract base cluster URL (everything before /v1.0)
+    if ($odataContext -match '^(https://[^/]+)') {
+        return $matches[1]
+    }
+
+    throw "Failed to parse WABI endpoint from: $odataContext"
+}
+
+# =============================
+# Get Current User and Access Token
+# =============================
+
+function Get-CurrentAccessToken {
+    try {
+        $accessTokenObject = Get-PowerBIAccessToken
+        $accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
+        return $accessToken
+    }
+    catch {
+        Write-Warning "Failed to get access token: $_"
+        return $null
+    }
+}
+
+function Get-CurrentUserPrincipalName {
+    try {
+        # Get the current user context from Power BI
+        $userUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/users"
+        $usersResponse = Invoke-PowerBIRestMethod -Method GET -Url $userUrl | ConvertFrom-Json
+        
+        if ($usersResponse -and $usersResponse.value -and $usersResponse.value.Count -gt 0) {
+            return $usersResponse.value[0].emailAddress
+        }
+    }
+    catch {
+        Write-Warning "Failed to get user principal name via API"
+    }
+    
+    # Alternative: try to extract from the access token
+    try {
+        $token = Get-CurrentAccessToken
+        $tokenParts = $token.Split('.')
+        if ($tokenParts.Length -ge 2) {
+            $payload = $tokenParts[1]
+            # Add padding if needed
+            while ($payload.Length % 4 -ne 0) { $payload += '=' }
+            $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+            $payloadObj = $decoded | ConvertFrom-Json
+            
+            if ($payloadObj.upn) {
+                return $payloadObj.upn
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed to extract user from token"
+    }
+    
+    Write-Warning "Could not determine current user principal name"
+    return $null
+}
+
+$currentUserPrincipalName = Get-CurrentUserPrincipalName
+
+
+# =============================
+# Build Principal Assignments
+# =============================
+
+function Get-PrincipalAssignments {
+    param([string]$CurrentUserPrincipalName)
+    
+    $principals = @()
+    
+    # Always include current user
+    if ($CurrentUserPrincipalName) {
+        $principals += [pscustomobject]@{
+            Identifier    = $CurrentUserPrincipalName
+            PrincipalType = 'User'
+            Label         = 'Tenant Admin'
+        }
+        Write-Host "[INFO] Will remove permissions for: Tenant Admin ($CurrentUserPrincipalName)"
+    }
+    
+    # Check if Service Principal App is configured
+    $ServicePrincipalObjectIdConfigured = -not [string]::IsNullOrWhiteSpace($AppObjectId)
+    if ($ServicePrincipalObjectIdConfigured) {
+        $principals += [pscustomobject]@{
+            Identifier    = $AppObjectId
+            PrincipalType = 'App'
+            Label         = 'Service Principal'
+        }
+        Write-Host "[INFO] Will remove permissions for: Service Principal ($AppObjectId)"
+    }
+    
+    # Check if Service Principal Security Group is configured
+    $ServicePrincipalSecurityGroupIdentifierConfigured = -not [string]::IsNullOrWhiteSpace($ServicePrincipalSecurityGroupIdentifier)
+    if ($ServicePrincipalSecurityGroupIdentifierConfigured) {
+        $principals += [pscustomobject]@{
+            Identifier    = $ServicePrincipalSecurityGroupIdentifier
+            PrincipalType = 'Group'
+            Label         = 'Service Principal Security Group'
+        }
+        Write-Host "[INFO] Will remove permissions for: SPN Security Group ($ServicePrincipalSecurityGroupIdentifier)"
+    }
+    
+    return $principals
+}
+
+$global:PrincipalAssignments = Get-PrincipalAssignments -CurrentUserPrincipalName $currentUserPrincipalName
+Write-Host "[INFO] Total principals to remove: $($global:PrincipalAssignments.Count)"
+Write-Host ""
+
+
+# =============================
+# Read Audit File
+# =============================
+
+Write-Host "[INFO] Reading audit file..."
+
+try {
+    $auditData = Import-Excel -Path $auditFilePath -WorksheetName "Workspaces with Zero Access"
+    
+    if (-not $auditData -or $auditData.Count -eq 0) {
+    }
+    
+    Write-Host "[SUCCESS] Found $($auditData.Count) workspace record(s) in the audit file"
+}
+catch {
+}
+
+Write-Host ""
+
+# =============================
+# Confirmation Dialog
+# =============================
+
+function Show-ConfirmationDialog {
+    param(
+        [Parameter(Mandatory=$true)]
+        [array]$Workspaces,
+        [Parameter(Mandatory=$true)]
+        [array]$PrincipalAssignments
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Confirm Workspace Permission Removal"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(600, 600)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Warning label
+    $warningLabel = New-Object System.Windows.Forms.Label
+    $warningLabel.Text = "Select workspaces to remove access for the following principals:"
+    $warningLabel.AutoSize = $false
+    $warningLabel.Size = New-Object System.Drawing.Size(560, 20)
+    $warningLabel.Location = New-Object System.Drawing.Point(20, 20)
+    $warningLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($warningLabel)
+
+    # Principals list label
+    $principalsLabel = New-Object System.Windows.Forms.Label
+    $principalsList = ($PrincipalAssignments | ForEach-Object { "• $($_.Label): $($_.Identifier)" }) -join "`n"
+    $principalsLabel.Text = $principalsList
+    $principalsLabel.AutoSize = $false
+    $principalsLabel.Size = New-Object System.Drawing.Size(560, ($PrincipalAssignments.Count * 20))
+    $principalsLabel.Location = New-Object System.Drawing.Point(20, 45)
+    $principalsLabel.ForeColor = [System.Drawing.Color]::DarkRed
+    $principalsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($principalsLabel)
+    
+    $listBoxY = 45 + ($PrincipalAssignments.Count * 20) + 10
+
+    # CheckedListBox for workspace selection
+    $checkedListBox = New-Object System.Windows.Forms.CheckedListBox
+    $checkedListBox.Location = New-Object System.Drawing.Point(20, $listBoxY)
+    $checkedListBox.Size = New-Object System.Drawing.Size(540, 250)
+    $checkedListBox.CheckOnClick = $true
+    $checkedListBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+    
+    # Add workspaces to checked listbox (all checked by default)
+    foreach ($workspace in $Workspaces) {
+        $workspaceName = $workspace.'Workspace Name'
+        $workspaceType = if ($workspace.'Type') { " [$($workspace.'Type')]" } else { "" }
+        $index = $checkedListBox.Items.Add("$workspaceName$workspaceType")
+        $checkedListBox.SetItemChecked($index, $true)
+    }
+    
+    $form.Controls.Add($checkedListBox)
+    
+    $selectAllY = $listBoxY + 260
+
+    # Select All checkbox
+    $selectAllCheckBox = New-Object System.Windows.Forms.CheckBox
+    $selectAllCheckBox.Text = "Select All / Deselect All"
+    $selectAllCheckBox.AutoSize = $true
+    $selectAllCheckBox.Location = New-Object System.Drawing.Point(20, $selectAllY)
+    $selectAllCheckBox.Checked = $true
+    $selectAllCheckBox.Add_CheckedChanged({
+        for ($i = 0; $i -lt $checkedListBox.Items.Count; $i++) {
+            $checkedListBox.SetItemChecked($i, $selectAllCheckBox.Checked)
+        }
+    })
+    $form.Controls.Add($selectAllCheckBox)
+
+    # Count label
+    $countLabel = New-Object System.Windows.Forms.Label
+    $countLabel.Text = "Total: $($Workspaces.Count) workspace(s) - All selected"
+    $countLabel.AutoSize = $true
+    $countLabel.Location = New-Object System.Drawing.Point(20, ($selectAllY + 25))
+    $countLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $form.Controls.Add($countLabel)
+
+    # Update count when selection changes
+    $checkedListBox.Add_ItemCheck({
+        param($sender, $e)
+        # Use BeginInvoke to update after the check state changes
+        $form.BeginInvoke([Action]{
+            $checkedCount = $checkedListBox.CheckedItems.Count
+            $countLabel.Text = "Total: $($Workspaces.Count) workspace(s) - $checkedCount selected"
+        })
+    })
+
+    # Warning message
+    $warningMessage = New-Object System.Windows.Forms.Label
+    $warningMessage.Text = "WARNING: This action cannot be undone!"
+    $warningMessage.AutoSize = $true
+    $warningMessage.Location = New-Object System.Drawing.Point(20, ($selectAllY + 50))
+    $warningMessage.ForeColor = [System.Drawing.Color]::Red
+    $warningMessage.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($warningMessage)
+
+    # Remove Access button
+    $removeButton = New-Object System.Windows.Forms.Button
+    $removeButton.Text = "Remove Access"
+    $removeButton.Size = New-Object System.Drawing.Size(150, 30)
+    $removeButton.Location = New-Object System.Drawing.Point(260, ($selectAllY + 80))
+    $removeButton.FlatStyle = 'Flat'
+    $removeButton.Add_Click({
+        if ($checkedListBox.CheckedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Please select at least one workspace to remove access from.",
+                "No Workspaces Selected",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+        $form.Tag = 'Proceed'
+        $form.Close()
+    })
+    $form.Controls.Add($removeButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(100, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(420, ($selectAllY + 80))
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        # If Tag is not set (form closed without button click), mark as cancelled
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancel'
+        }
+    })
+
+    # Set default and cancel buttons
+    $form.AcceptButton = $removeButton
+    $form.CancelButton = $cancelButton
+    [void]$form.ShowDialog()
+
+    # Return result with selected workspace indices
+    if ($form.Tag -eq 'Proceed') {
+        $selectedIndices = @()
+        for ($i = 0; $i -lt $checkedListBox.Items.Count; $i++) {
+            if ($checkedListBox.GetItemChecked($i)) {
+                $selectedIndices += $i
+            }
+        }
+        return @{
+            Action = 'Proceed'
+            SelectedIndices = $selectedIndices
+        }
+    }
+    else {
+        return @{ Action = 'Cancel' }
+    }
+}
+
+# =============================
+# Display Workspaces and Confirmation
+# =============================
+
+Write-Host "The following workspaces will be processed:"
+Write-Host ""
+Write-Host "Date/Time           | Workspace Name"
+Write-Host "--------------------+-------------------------------------------"
+
+$auditData | ForEach-Object {
+    $dateTime = $_.'Date/Time'
+    $workspaceName = $_.'Workspace Name'
+    Write-Host "$dateTime | $workspaceName"
+}
+
+Write-Host ""
+Write-Host "[INFO] Total: $($auditData.Count) workspace(s)"
+Write-Host ""
+
+# Get unique workspace IDs (in case there are duplicates from multiple runs)
+$uniqueWorkspaceIds = $auditData | Select-Object -Property 'Workspace ID', 'Workspace Name', 'Type' -Unique
+Write-Host "[INFO] Unique workspaces to process: $($uniqueWorkspaceIds.Count)"
+Write-Host ""
+
+# Show confirmation dialog
+$confirmationResult = Show-ConfirmationDialog -Workspaces $uniqueWorkspaceIds -PrincipalAssignments $global:PrincipalAssignments
+
+if ($confirmationResult.Action -ne 'Proceed') {
+}
+
+# Filter to only selected workspaces
+$selectedWorkspaces = @()
+foreach ($index in $confirmationResult.SelectedIndices) {
+    $selectedWorkspaces += $uniqueWorkspaceIds[$index]
+}
+
+Write-Host "[INFO] Processing $($selectedWorkspaces.Count) selected workspace(s)..."
+Write-Host ""
+
+# =============================
+# Remove Principals from Workspaces
+# =============================
+
+function Remove-PrincipalFromWorkspace {
+    param(
+        [string]$WorkspaceId,
+        [string]$Identifier,
+        [string]$PrincipalType,
+        [string]$Label,
+        [string]$WorkspaceType
+    )
+    
+    # Personal and PersonalGroup workspaces cannot be updated via supported APIs
+    if ($WorkspaceType -eq "Personal" -or $WorkspaceType -eq "PersonalGroup") {
+        Write-Warning "Skipping permission removal for Personal or PersonalGroup workspace $WorkspaceId (unsupported)."
+        return $false
+    }
+    
+    # Use admin endpoint for removing principals from regular workspaces
+    # Add ?isGroup=True query parameter for Group principal types (required for deletion)
+    $removeUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$WorkspaceId/users/$Identifier"
+    if ($PrincipalType -eq 'Group') {
+        $removeUrl += "?isGroup=True"
+    }
+    
+    try {
+        # Use direct REST call with bearer token for DELETE operations
+        $accessToken = Get-CurrentAccessToken
+        $headers = @{
+            'Authorization' = "Bearer $accessToken"
+            'Content-Type' = 'application/json'
+        }
+        
+        Invoke-RestMethod -Uri $removeUrl -Headers $headers -Method DELETE | Out-Null
+        return $true
+    }
+    catch {
+        Write-Warning "Failed to remove $Label from workspace: $_"
+        return $false
+    }
+}
+
+# Keep backward compatibility function
+function Remove-UserFromWorkspace {
+    param(
+        [string]$WorkspaceId,
+        [string]$UserPrincipalName,
+        [string]$WorkspaceType
+    )
+    
+    return Remove-PrincipalFromWorkspace `
+        -WorkspaceId $WorkspaceId `
+        -Identifier $UserPrincipalName `
+        -PrincipalType 'User' `
+        -Label 'User' `
+        -WorkspaceType $WorkspaceType
+}
+
+Write-Host "[INFO] Removing principals from selected workspaces..."
+Write-Host ""
+
+$successCount = 0
+$failureCount = 0
+$failedRemovals = @()
+
+foreach ($workspace in $selectedWorkspaces) {
+    $workspaceId = $workspace.'Workspace ID'
+    $workspaceName = $workspace.'Workspace Name'
+    # Default to 'Standard' if Type is not specified in the Excel file
+    $workspaceType = if ($workspace.'Type') { $workspace.'Type' } else { "Standard" }
+    
+    Write-Host "[PROCESSING] $workspaceName ($workspaceId)"
+
+    if ($workspaceType -eq "Personal" -or $workspaceType -eq "PersonalGroup") {
+        Write-Host "[INFO] Skipping $workspaceType workspace (permission changes unsupported): $workspaceName"
+        continue
+    }
+    
+    # Remove all configured principals from this workspace
+    foreach ($principal in $global:PrincipalAssignments) {
+        Write-Host "  Removing $($principal.Label): $($principal.Identifier)"
+        
+        $success = Remove-PrincipalFromWorkspace `
+            -WorkspaceId $workspaceId `
+            -Identifier $principal.Identifier `
+            -PrincipalType $principal.PrincipalType `
+            -Label $principal.Label `
+            -WorkspaceType $workspaceType
+        
+        if ($success) {
+            Write-Host "  [SUCCESS] Removed $($principal.Label) from workspace" -ForegroundColor Green
+            $successCount++
+        } else {
+            Write-Host "  [FAILED] Could not remove $($principal.Label) from workspace" -ForegroundColor Red
+            $failureCount++
+            $failedRemovals += [PSCustomObject]@{
+                'Workspace ID' = $workspaceId
+                'Workspace Name' = $workspaceName
+                'Principal' = $principal.Label
+                'Identifier' = $principal.Identifier
+            }
+        }
+    }
+    
+    Write-Host ""
+}
+
+# =============================
+# Summary
+# =============================
+
+Write-Host "======================================"
+Write-Host "Cleanup Summary"
+Write-Host "======================================"
+Write-Host ""
+Write-Host "Total workspaces available:    $($uniqueWorkspaceIds.Count)"
+Write-Host "Selected for processing:       $($selectedWorkspaces.Count)"
+Write-Host "Principals removed per workspace: $($global:PrincipalAssignments.Count)"
+Write-Host "Total removal operations:      $($selectedWorkspaces.Count * $global:PrincipalAssignments.Count)"
+Write-Host "Successfully removed:          $successCount" -ForegroundColor Green
+Write-Host "Failed:                        $failureCount" -ForegroundColor $(if ($failureCount -gt 0) { "Red" } else { "White" })
+Write-Host ""
+
+if ($failureCount -gt 0) {
+    Write-Host "Failed Removals:" -ForegroundColor Red
+    $failedRemovals | Format-Table -AutoSize
+    Write-Host ""
+    Write-Host "You may need to manually remove these principals from the listed workspaces." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+Write-Host "[INFO] Cleanup operation completed"
+ 
