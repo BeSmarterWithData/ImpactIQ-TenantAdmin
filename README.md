@@ -18,6 +18,9 @@ This version is designed for users who may need to run extraction beyond their e
 ### Run Modes
 The main script supports three execution paths:
 
+<img width="701" height="232" alt="image" src="https://github.com/user-attachments/assets/6fb578fa-bbd7-4726-9df6-9c76bfc833f0" />
+
+
 1. **Normal User Mode**
    - Runs only within workspaces you can already access.
 
