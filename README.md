@@ -4,7 +4,7 @@
 <em><strong>Be smarter with every change</strong></em>
   <br/>
   <br/>
-  <em>One-Click, Designed for Everyone</em>
+  <em>Tenant-Admin Edidion - One-Click</em>
 </p>
 
 # Impact Analysis and Governance for Power BI + Fabric (Tenant Admin Edition)
