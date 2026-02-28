@@ -18,7 +18,7 @@ This version is designed for users who may need to run extraction beyond their e
 ### Run Modes
 The main script supports three execution paths:
 
-![Tenant Modes](https://github.com/user-attachments/assets/f79e70cf-c8f7-4e1f-89e3-a191be614009)
+<img width="693" height="233" alt="image" src="https://github.com/user-attachments/assets/66c78571-eb9d-4eb2-854d-3d01baf87bb0" />
 
 
 
