@@ -72,6 +72,8 @@ The solution provides:
 - Visual-level impact analysis for reports and semantic model objects.
 - Used/unused object visibility for model cleanup opportunities.
 - Backup + metadata extraction for models, reports, and dataflows.
+- Permission extraction across the tenant scope selected for the run, including workspace, dataset, report, app, dataflow, and pipeline access.
+- Inclusion of extracted permission data in the final governance outputs (Excel extract and the Power BI model/report built from it).
 - A consolidated Power BI governance model output via `Power BI Governance Model.pbit`.
 
 ## Local Files in This Repo
@@ -125,3 +127,7 @@ In addition to tenant-admin execution options, Impact IQ provides the following 
 
 10. **Consolidated Governance Model Output**
    - Combines extracted artifacts into `Power BI Governance Model.pbit` for exploration, impact analysis, and sharing.
+
+11. **Comprehensive Permission Extraction**
+  - Pulls user/access-right details for every included workspace and related artifacts (datasets, reports, apps, dataflows, and deployment pipelines).
+  - Included in the final output model/report for tenant-wide governance and security review.
