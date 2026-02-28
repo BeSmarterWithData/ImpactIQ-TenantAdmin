@@ -1600,7 +1600,6 @@ $datasetRefreshSchedule = @()
 $dataflowRefreshHistory = @()
 
 # Initialize new user permission collections
-$activityEvents = @()
 $datasetUsers = @()
 $appUsers = @()
 $dataflowUsers = @()
@@ -2251,85 +2250,6 @@ Write-Output "My Workspace Metadata Extract Process Completed"
 if ($usingAdminAPI) {
     Write-Output "Fetching Admin User Permission Data - Process Started"
 
-# Fetch Activity Events
-Write-Output "Fetching Activity Events"
-
-$activityEvents = @()
-
-# Date range (yesterday back 27 days)
-$endDate = (Get-Date).ToUniversalTime().Date.AddDays(-1)
-$startDate = $endDate.AddDays(-27)
-
-$currentDate = $startDate
-
-# Get selected workspace IDs for filtering
-$selectedWorkspaceIds = @($workspacesInfo | ForEach-Object { $_.WorkspaceId })
-
-while ($currentDate -le $endDate) {
-
-    $dayStart = "'$($currentDate.ToString("yyyy-MM-ddT00:00:00Z"))'"
-    $dayEnd   = "'$($currentDate.ToString("yyyy-MM-ddT23:59:59Z"))'"
-
-    $continuationToken = $null
-    
-    do {
-        $activityUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/activityevents" +
-                       "?startDateTime=$dayStart&endDateTime=$dayEnd"
-        
-        if ($continuationToken) {
-            $activityUrl += "&continuationToken=$continuationToken"
-        }
-        
-        try {
-            $response = Invoke-PowerBIRestMethod -Method GET -Url $activityUrl -ErrorAction Stop | ConvertFrom-Json
-
-            if ($response.activityEventEntities) {
-                $activityEvents += $response.activityEventEntities
-            }
-
-            $continuationToken = $response.continuationToken
-        }
-        catch {
-            $continuationToken = $null
-        }
-        
-    } while ($continuationToken)
-
-    $currentDate = $currentDate.AddDays(1)
-}
-
-Write-Host "Total activity events collected for selected workspaces: $($activityEvents.Count)"
-
-    # Normalize activity events to ensure all columns are present across all rows
-    if ($activityEvents -and $activityEvents.Count -gt 0) {
-        Write-Host "[INFO] Normalizing activity events schema..."
-        
-        # Discover all unique properties across all events
-        $allProperties = $activityEvents | 
-            ForEach-Object { $_.PSObject.Properties.Name } | 
-            Select-Object -Unique | 
-            Sort-Object
-        
-        # Normalize each event to ensure all properties exist
-        $normalizedEvents = foreach ($event in $activityEvents) {
-            $normalizedEvent = [ordered]@{}
-            foreach ($prop in $allProperties) {
-                $val = $event.PSObject.Properties[$prop].Value
-                if ($null -eq $val) {
-                    $normalizedEvent[$prop] = $null
-                } elseif ($val -is [string]) {
-                    $normalizedEvent[$prop] = $val
-                } else {
-                    $normalizedEvent[$prop] = $val | ConvertTo-Json -Compress -Depth 10
-                }
-            }
-            [PSCustomObject]$normalizedEvent
-        }
-        
-        $activityEvents = $normalizedEvents
-        Write-Host "[INFO] Normalized $($activityEvents.Count) activity events with $($allProperties.Count) columns"
-    }
-
     # Fetch Dataset Users for each dataset in selected workspaces
     Write-Output "Fetching Dataset Users..."
     foreach ($dataset in $datasetsInfo) {
@@ -2538,13 +2458,6 @@ $appsInfo | Export-Excel -Path $excelFile -WorksheetName "Apps" -AutoSize -Appen
 $reportsInAppInfo | Export-Excel -Path $excelFile -WorksheetName "AppReports" -AutoSize -Append
 
 # Export new admin user permission worksheets (create empty sheets if not admin mode)
-if ($activityEvents -and $activityEvents.Count -gt 0) {
-    $activityEvents | Export-Excel -Path $excelFile -WorksheetName "ActivityEvents" -AutoSize -Append
-} else {
-    # Create empty worksheet
-    @() | Export-Excel -Path $excelFile -WorksheetName "ActivityEvents" -AutoSize -Append
-}
-
 if ($datasetUsers -and $datasetUsers.Count -gt 0) {
     $datasetUsers | Export-Excel -Path $excelFile -WorksheetName "DatasetUsers" -AutoSize -Append
 } else {
