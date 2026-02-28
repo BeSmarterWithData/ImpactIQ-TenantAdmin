@@ -18,7 +18,8 @@ This version is designed for users who may need to run extraction beyond their e
 ### Run Modes
 The main script supports three execution paths:
 
-<img width="350" height="115" alt="image" src="https://github.com/user-attachments/assets/655aca21-7d59-4cf9-a168-8eaf58c0f7c5" />
+![Screenshot 2026-02-27 220151](https://github.com/user-attachments/assets/acdc6687-8eed-4b52-b707-bfcf99c947a3)
+
 
 
 
