@@ -15,6 +15,10 @@ This repository is the **Tenant Admin edition** of Impact IQ. It follows the sam
 
 This version is designed for users who may need to run extraction beyond their existing workspace membership.
 
+>*If looking for the core Impact IQ's One-Click, Designed for Everyone edition that runs on any computer, provides report, model, and dataflow backups, and leverages the Power BI + Fabric Service and REST API across all Workspaces, check out: https://github.com/BeSmarterWithData/ImpactIQ*
+
+>*Have specific Reports and/or Models downloaded you want to analyze? Don't have direct access to the Workspace but have the PBIX? Check out Impact IQ's Local edition here: https://github.com/BeSmarterWithData/ImpactIQ-Local*
+
 ### Run Modes
 The main script supports three execution paths:
 
