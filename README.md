@@ -37,6 +37,58 @@ The main script supports three execution paths:
    - Runs across all workspaces.
    - Temporarily grants needed workspace permissions for model/report/dataflow extraction.
    - Automatically removes those temporary permissions at the end.
+  
+## 🚀 Quick Start Instructions  
+
+You’ve got **two ways** to get started:  
+
+
+### 🟢 One-Click Update & Run Tool (Recommended)  
+Always up-to-date and the easiest way to get started.  
+
+➡️ [**Download Impact IQ - Tenant Admin - One-Click Update & Run Tool**](https://github.com/BeSmarterWithData/ImpactIQ-TenantAdmin/releases/download/v1.0/ImpactIQ-TenantAdmin.bat)
+
+This automatically:  
+1. Pulls the latest repo from GitHub
+2. Places it into `C:\Power BI Backups`
+3. Runs the **Tenant Admin Final PS Script**  
+4. Opens the **Power BI Governance Model** at the end  
+
+> 💡 **Tip:** Once downloaded, simply re-run this locally anytime to keep your **backups** and **governance details up-to-date** *and* take advantage of the **newest features**.  
+
+> ⚠️ If security policies block the batch file, follow the manual steps below instead.
+
+
+📂 **All backups and the final Power BI Governance Model will be saved to:** `C:\Power BI Backups`
+
+
+---
+
+### 🟡 Option 2 — Manual Setup  
+
+#### ✅ Step 1: Create Folder  
+> Make a folder at:  `C:\Power BI Backups`  
+
+#### ✅ Step 2: Add Files  
+> Download all repo files and place them into the newly-created `C:\Power BI Backups` folder.  
+
+#### ✅ Step 3: Run Script  
+> Open PowerShell and run the Final PS Script. You can:  
+> - Copy/paste the full script, or  
+> - Rename `Tenant Admin Final PS Script.txt` → `Tenant Admin Final PS Script.ps1` and run directly  
+> 
+> **Environment Selection**: When prompted, choose your Power BI environment:
+> - Press **Enter** for Public cloud (default)
+> - Or choose: `Germany`, `USGov`, `China`, `USGovHigh`, or `USGovMil` for sovereign clouds.
+> - If no selection is made after 120 seconds, it will continue with the default of Public.
+
+#### ✅ Step 4: Open the Power BI File  
+> Open: `Power BI Governance Model.pbit`  
+> → Let it refresh, then save as `.pbix`  
+
+---
+
+🎉 That’s it — enjoy! 🎉
 
 ## Included Scripts
 
