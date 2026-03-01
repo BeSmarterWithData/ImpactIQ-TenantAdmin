@@ -1429,18 +1429,25 @@ if ($hasAdminAccess) {
     }
 }
 
+# --- Filter Personal/PersonalGroup workspaces from picker ---
+# These workspace types don't support elevated permissions or backups
+$personalWorkspaces = @($workspacesResponse.value | Where-Object { $_.type -eq 'Personal' -or $_.type -eq 'PersonalGroup' })
+$nonPersonalWorkspaces = @($workspacesResponse.value | Where-Object { $_.type -ne 'Personal' -and $_.type -ne 'PersonalGroup' })
+if ($personalWorkspaces.Count -gt 0) {
+    Write-Host "[INFO] Filtered out $($personalWorkspaces.Count) Personal/PersonalGroup workspace(s) from picker"
+}
+
 # --- Try WinForms picker; fallback if GUI not available ---
 try {
-    $selection = Show-WorkspacePicker -Workspaces $workspacesResponse.value
+    $selection = Show-WorkspacePicker -Workspaces $nonPersonalWorkspaces
 }
 catch {
     Write-Warning "WinForms not available. Defaulting to ALL workspaces and INCLUDING My Workspace."
     $selection = [pscustomobject]@{
-        SelectedWorkspaceIds = $workspacesResponse.value.id
+        SelectedWorkspaceIds = $nonPersonalWorkspaces.id
         IncludeMyWorkspace   = $true
     }
 }
-
 # Build filtered workspaces
 $selectedWorkspaceIds = @($selection.SelectedWorkspaceIds)
 
@@ -1452,6 +1459,17 @@ if ((-not $selectedWorkspaceIds -or $selectedWorkspaceIds.Count -eq 0) -and -not
 foreach ($workspace in $workspacesResponse.value) {
     if ($selectedWorkspaceIds -notcontains $workspace.id) { continue }
     $workspacesInfo += Rename-Properties -object $workspace -renameMap $workspaceRenameMap
+}
+
+# If all non-personal workspaces were selected (effectively "Select All"), include Personal/PersonalGroup
+# workspaces for metadata extraction only (they will be skipped for backups and elevated permissions)
+$allNonPersonalIds = @($nonPersonalWorkspaces | ForEach-Object { $_.id })
+$allNonPersonalSelected = ($allNonPersonalIds.Count -gt 0) -and (-not ($allNonPersonalIds | Where-Object { $selectedWorkspaceIds -notcontains $_ }))
+if (($allNonPersonalSelected -or $selection.TimedOut) -and $personalWorkspaces.Count -gt 0) {
+    Write-Host "[INFO] All workspaces selected - including $($personalWorkspaces.Count) Personal/PersonalGroup workspace(s) for metadata extraction"
+    foreach ($personalWs in $personalWorkspaces) {
+        $workspacesInfo += Rename-Properties -object $personalWs -renameMap $workspaceRenameMap
+    }
 }
 
 # Flag for later "My Workspace" section
@@ -2534,6 +2552,11 @@ foreach ($dataset in $datasetsInfo) {
     # Get workspace details
     $workspace = $workspacesInfo | Where-Object { $_.WorkspaceId -eq $dataset.WorkspaceId }
 
+    # Skip Personal/PersonalGroup workspaces (not supported for backups) — except "My Workspace"
+    if (($workspace.WorkspaceType -eq "Personal" -or $workspace.WorkspaceType -eq "PersonalGroup") -and $workspace.WorkspaceName -ne "My Workspace") {
+        continue
+    }
+
     # Check if the workspace is Premium or Fabric capacity before proceeding
     if ($workspace.WorkspaceIsOnDedicatedCapacity -eq $true) {
 
@@ -2663,6 +2686,12 @@ function Export-ReportUsingAPI {
 	    $workspaceId = $workspace.WorkspaceId
 	
         # Exception: "My Workspace" (exact name) should always be processed if selected
+
+        # Skip Personal/PersonalGroup workspaces (not supported for backups) — except "My Workspace"
+        if (($workspace.WorkspaceType -eq "Personal" -or $workspace.WorkspaceType -eq "PersonalGroup") -and $workspaceName -ne "My Workspace") {
+            Write-Host "[INFO] Skipping report backup for Personal/PersonalGroup workspace: $workspaceName"
+            continue
+        }
 	
 	    # Clean up workspace name
 	    $cleanWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
@@ -2933,6 +2962,11 @@ foreach ($dataset in $datasetsInfo) {
 
     # Get workspace details to check type
     $workspace = $workspacesInfo | Where-Object { $_.WorkspaceId -eq $dataset.WorkspaceId }
+
+    # Skip Personal/PersonalGroup workspaces (not supported for detail extraction from backups) — except "My Workspace"
+    if (($workspace.WorkspaceType -eq "Personal" -or $workspace.WorkspaceType -eq "PersonalGroup") -and $workspaceName -ne "My Workspace") {
+        continue
+    }
     
     # Clean up workspace name
     $cleanDatasetWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
@@ -3002,8 +3036,11 @@ foreach ($dataset in $datasetsInfo) {
 
     # Get workspace details to check type
     $workspace = $workspacesInfo | Where-Object { $_.WorkspaceId -eq $dataset.WorkspaceId }
-    
-    # Exception: "My Workspace" (exact name) should always be processed if selected
+
+    # Skip Personal/PersonalGroup workspaces (not supported for detail extraction from backups) — except "My Workspace"
+    if (($workspace.WorkspaceType -eq "Personal" -or $workspace.WorkspaceType -eq "PersonalGroup") -and $workspaceName -ne "My Workspace") {
+        continue
+    }
 
     # Clean up workspace name
     $cleanDatasetWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
@@ -3282,10 +3319,14 @@ foreach ($workspace in $workspacesInfo) {
         }
     }
 
+    # Skip Personal/PersonalGroup workspaces (not supported for backups) — except "My Workspace"
+    if (($workspace.WorkspaceType -eq "Personal" -or $workspace.WorkspaceType -eq "PersonalGroup") -and $workspace.WorkspaceName -ne "My Workspace") {
+        Write-Host "[INFO] Skipping dataflow backup for Personal/PersonalGroup workspace: $($workspace.WorkspaceName)"
+        continue
+    }
+
     $workspaceName = $workspace.WorkspaceName
     $workspaceId = $workspace.WorkspaceId
-
-    # Exception: "My Workspace" (exact name) should always be processed if selected
 
     # Set the Power BI REST API URL for the dataflow details (using regular API since we now have access)
     $dataflowDetailsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$workspaceId/dataflows"
@@ -3417,10 +3458,14 @@ foreach ($workspace in $workspacesInfo) {
         }
     }
 
+    # Skip Personal/PersonalGroup workspaces (not supported for backups) — except "My Workspace"
+    if (($workspace.WorkspaceType -eq "Personal" -or $workspace.WorkspaceType -eq "PersonalGroup") -and $workspace.WorkspaceName -ne "My Workspace") {
+        Write-Host "[INFO] Skipping Gen2 dataflow backup for Personal/PersonalGroup workspace: $($workspace.WorkspaceName)"
+        continue
+    }
+
     $workspaceName = $workspace.WorkspaceName
     $workspaceId = $workspace.WorkspaceId
-    
-    # Exception: "My Workspace" (exact name) should always be processed if selected
     
     # Set the Fabric API URL for items
     $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items"
