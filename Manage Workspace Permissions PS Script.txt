@@ -2,7 +2,7 @@
 # Power BI Workspace Permission Manager
 # ====================================
 # This script allows you to add or remove workspace permissions
-# for the current user using Power BI Admin APIs
+# for the current user, a group, or SPN using Power BI Admin APIs
 
 $ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
 
