@@ -1475,6 +1475,10 @@ if (($allNonPersonalSelected -or $selection.TimedOut) -and $personalWorkspaces.C
 # Flag for later "My Workspace" section
 $IncludeMyWorkspace = $selection.IncludeMyWorkspace
 
+# Preserve the full workspace list (all selected + personal) for the Workspaces Excel sheet.
+# This must be captured BEFORE Tenant Admin mode filters $workspacesInfo down to only workspaces with items.
+$allWorkspacesInfoForExcel = @($workspacesInfo)
+
 # =============================
 # Create Tenant Permission Workspace List (for Tenant Admin Mode only)
 # =============================
@@ -2469,7 +2473,7 @@ if (Test-Path $excelFile) {
     Remove-Item $excelFile -Force
 }
 
-$workspacesInfo | Export-Excel -Path $excelFile -WorksheetName "Workspaces" -AutoSize
+$allWorkspacesInfoForExcel | Export-Excel -Path $excelFile -WorksheetName "Workspaces" -AutoSize
 $fabricItemsInfo | Export-Excel -Path $excelFile -WorksheetName "FabricItems" -AutoSize -Append
 $datasetsInfo | Export-Excel -Path $excelFile -WorksheetName "Datasets" -AutoSize -Append
 $datasetSourcesInfo | Export-Excel -Path $excelFile -WorksheetName "DatasetSourcesInfo" -AutoSize -Append
