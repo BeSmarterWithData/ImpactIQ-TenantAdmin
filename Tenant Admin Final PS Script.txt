@@ -1485,9 +1485,16 @@ if ($isTenantAdminMode) {
     Write-Host "[INFO] Tenant Admin Mode: Filtering workspaces by those with Fabric/Power BI items..."
     
     # Get workspace IDs that have items from the selected workspaces (returns hashtable with counts)
+    # Include personal workspace IDs when Select All was used, so they get proper item tracking
+    $allWorkspaceIdsForItemCheck = @($selectedWorkspaceIds)
+    if ($allNonPersonalSelected -and $personalWorkspaces.Count -gt 0) {
+        $allWorkspaceIdsForItemCheck += @($personalWorkspaces | ForEach-Object { $_.id })
+        Write-Host "[INFO] Including $($personalWorkspaces.Count) Personal/PersonalGroup workspace(s) in item check"
+    }
+    
     $workspacesWithItemsHash = @{}
-    if ($selectedWorkspaceIds -and $selectedWorkspaceIds.Count -gt 0) {
-        $workspacesWithItemsHash = Get-WorkspacesWithFabricItems -WorkspaceIds $selectedWorkspaceIds
+    if ($allWorkspaceIdsForItemCheck -and $allWorkspaceIdsForItemCheck.Count -gt 0) {
+        $workspacesWithItemsHash = Get-WorkspacesWithFabricItems -WorkspaceIds $allWorkspaceIdsForItemCheck
     }
     
     # Store the item counts globally for later use
@@ -1506,6 +1513,8 @@ if ($isTenantAdminMode) {
         
         # IMPORTANT: In Tenant Admin mode, filter $workspacesInfo to only workspaces with items
         # This ensures grant/revoke permissions only applies to workspaces that need it
+        # Personal/PersonalGroup workspaces are included here if they have items (their IDs
+        # were added to the item check above when Select All was used)
         Write-Host "[INFO] Filtering workspace processing to only workspaces with items..."
         $workspacesInfo = @($workspacesInfo | Where-Object { $workspacesWithItemsHash.ContainsKey($_.WorkspaceId) })
         Write-Host "[INFO] Will process $($workspacesInfo.Count) workspace(s) with items"
