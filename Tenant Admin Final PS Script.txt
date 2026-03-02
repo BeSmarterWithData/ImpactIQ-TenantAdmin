@@ -1542,8 +1542,8 @@ if ($isTenantAdminMode) {
 # Track workspaces where we granted/changed access
 $global:tempAccessGrantedWorkspaces = @()
 
-# Only grant access if using Admin API (user has tenant admin permissions)
-if ($usingAdminAPI) {
+# Only grant access if using Tenant Admin mode (not Accessible mode, where user already has access)
+if ($isTenantAdminMode) {
     Write-Output "Checking workspace access and granting temporary admin rights where needed..."
     
     # Get current user's principal name
@@ -1609,6 +1609,8 @@ if ($usingAdminAPI) {
     }
     
     Write-Output "Workspace access check completed. Modified access for $($global:tempAccessGrantedWorkspaces.Count) workspace(s)."
+} elseif ($usingAdminAPI) {
+    Write-Host "[INFO] Skipping temporary access grants - using admin APIs on workspaces you already have access to"
 } else {
     Write-Host "[INFO] Using regular API - no temporary access grants needed (you already have access to these workspaces)"
 }
