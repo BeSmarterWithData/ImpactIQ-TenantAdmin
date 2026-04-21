@@ -266,10 +266,6 @@ function Connect-PowerBI {
     } else {
         Connect-PowerBIServiceAccount | Out-Null
     }
-
-    $global:accessTokenObject = Get-PowerBIAccessToken
-    $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
-    Set-Content -Path $env:TEMP\PowerBI_TempAccessToken.txt -Value $global:accessToken
 }
 
 try {
@@ -288,13 +284,19 @@ Write-Host ""
 
 function Get-CurrentAccessToken {
     try {
-        $accessTokenObject = Get-PowerBIAccessToken
-        $accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
-        return $accessToken
+        return (Get-PowerBIAccessToken).Authorization -replace 'Bearer ', ''
     }
     catch {
-        Write-Warning "Failed to get access token: $_"
-        return $null
+        # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
+        Write-Host "[WARN] Token fetch failed, re-connecting..."
+        try {
+            Connect-PowerBIServiceAccount | Out-Null
+            return (Get-PowerBIAccessToken).Authorization -replace 'Bearer ', ''
+        }
+        catch {
+            Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
+            throw "Cannot obtain Power BI access token."
+        }
     }
 }
 

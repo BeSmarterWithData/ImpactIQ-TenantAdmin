@@ -20,7 +20,7 @@ if (-not (Test-Path $configFolder)) {
     New-Item -Path $configFolder -ItemType Directory -Force | Out-Null
 }
 
-$global:TokenFilePath = Join-Path $configFolder "PowerBI_TempAccessToken.txt"
+# Token is now managed via MSAL session (Get-PowerBIAccessToken) — no file needed
 
 $ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
 
@@ -413,10 +413,6 @@ function Connect-PowerBI {
     } else {
         Connect-PowerBIServiceAccount | Out-Null
     }
-
-    $global:accessTokenObject = Get-PowerBIAccessToken
-    $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
-    Set-Content -Path $global:TokenFilePath -Value $global:accessToken
 }
 
 # Track script start time
@@ -432,56 +428,23 @@ catch {
 }
 
 
-# Function to refresh the token in a background job
-# Start a background job that refreshes the token. Pass the environment so child job can reconnect correctly.
-function Start-TokenRefreshJob {
-    param(
-        [string]$Environment,
-        [string]$BaseFolderPath
-    )
-
-    $jobScript = {
-        param($EnvArg, $BaseFolderPathArg)
-
-        $tokenDirectory = Join-Path -Path $BaseFolderPathArg -ChildPath 'Config'
-        if (-not (Test-Path -Path $tokenDirectory)) {
-            New-Item -Path $tokenDirectory -ItemType Directory -Force | Out-Null
+# Function to get the current access token — MSAL auto-refreshes silently via the session cache
+function Get-CurrentAccessToken {
+    try {
+        return (Get-PowerBIAccessToken).Authorization -replace 'Bearer ', ''
+    }
+    catch {
+        # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
+        Write-Host "[WARN] Token fetch failed, re-connecting..."
+        try {
+            Connect-PowerBIServiceAccount | Out-Null
+            return (Get-PowerBIAccessToken).Authorization -replace 'Bearer ', ''
         }
-        $tokenFilePath = Join-Path -Path $tokenDirectory -ChildPath 'PowerBI_TempAccessToken.txt'
-
-        function Connect-PowerBI {
-            param(
-                [string]$Environment,
-                [string]$TokenFilePath
-            )
-
-            if ($Environment) {
-                Connect-PowerBIServiceAccount -Environment $Environment | Out-Null
-            } else {
-                Connect-PowerBIServiceAccount | Out-Null
-            }
-            $global:accessTokenObject = Get-PowerBIAccessToken
-            $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
-            Set-Content -Path $TokenFilePath -Value $global:accessToken
-        }
-
-        while ($true) {
-            Start-Sleep -Seconds 3300  # Sleep for 55 minutes
-            Connect-PowerBI -Environment $EnvArg -TokenFilePath $tokenFilePath
+        catch {
+            Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
+            throw "Cannot obtain Power BI access token."
         }
     }
-
-    # Start the job and pass the environment as an argument
-    Start-Job -ScriptBlock $jobScript -Name "TokenRefreshJob" -ArgumentList $Environment, $BaseFolderPath | Out-Null
-}
-
-# Start the background job to refresh the token
-Start-TokenRefreshJob -Environment $LoginEnvironment -BaseFolderPath $global:BaseFolderPath
-
-# Function to get the current access token
-function Get-CurrentAccessToken {
-    $global:accessToken = Get-Content -Path $global:TokenFilePath
-    return $global:accessToken
 }
 
 # Create a variable date
@@ -2566,14 +2529,6 @@ if ($usingAdminAPI) {
     Write-Output "Skipping workspace access restoration - User role mode selected (no temporary permissions were granted)."
 }
 
-
-# Stop the background job after script completion
-Stop-Job -Name "TokenRefreshJob"
-Remove-Job -Name "TokenRefreshJob"
-
-if (Test-Path -Path $global:TokenFilePath) {
-    Remove-Item -Path $global:TokenFilePath -Force
-}
 
 Write-Output "All Excel files processed and combined successfully."
 
