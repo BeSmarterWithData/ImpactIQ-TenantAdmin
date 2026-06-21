@@ -729,6 +729,66 @@ function Show-RunModeDialog {
 }
 
 # ================================
+# Show Report Scope Selection Dialog
+# ================================
+function Show-ReportScopeDialog {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "ImpactIQ - Report Selection Scope"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(440, 250)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Which reports would you like to choose from?"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $form.Controls.Add($label)
+
+    $btnAll = New-Object System.Windows.Forms.Button
+    $btnAll.Text = "Reports from ALL workspaces"
+    $btnAll.Size = New-Object System.Drawing.Size(380, 40)
+    $btnAll.Location = New-Object System.Drawing.Point(20, 55)
+    $btnAll.Add_Click({
+        $form.Tag = 'All'
+        $form.Close()
+    })
+    $form.Controls.Add($btnAll)
+
+    $btnSpecific = New-Object System.Windows.Forms.Button
+    $btnSpecific.Text = "Reports from specific workspace(s)"
+    $btnSpecific.Size = New-Object System.Drawing.Size(380, 40)
+    $btnSpecific.Location = New-Object System.Drawing.Point(20, 105)
+    $btnSpecific.Add_Click({
+        $form.Tag = 'Specific'
+        $form.Close()
+    })
+    $form.Controls.Add($btnSpecific)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Size = New-Object System.Drawing.Size(380, 30)
+    $btnCancel.Location = New-Object System.Drawing.Point(20, 155)
+    $btnCancel.Add_Click({
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+    $form.Controls.Add($btnCancel)
+
+    $form.Add_FormClosing({
+        param($sender, $e)
+        if (-not $form.Tag) { $form.Tag = 'Cancel' }
+    })
+
+    [void]$form.ShowDialog()
+    return $form.Tag
+}
+
+# ================================
 # Show Report Picker Dialog
 # ================================
 function Show-ReportPicker {
@@ -1642,75 +1702,131 @@ if (-not $hasAdminAccess -or $userChoiceForceUserMode) {
         $runMode = Show-RunModeDialog
 
         if ($runMode -eq 'Reports') {
-            # ---- Reports Mode: fetch reports from all accessible workspaces, let user pick ----
-            Write-Host "[INFO] Fetching reports from all accessible workspaces for selection..."
-            $allReportsForPicker = @()
-            $wsCount = 0
-            foreach ($ws in $workspacesResponse.value) {
-                $wsCount++
-                Write-Host "`r[INFO] Scanning workspace $wsCount of $($workspacesResponse.value.Count): $($ws.name)" -NoNewline
-                $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/reports"
-                try {
-                    $reportsResp = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
-                    foreach ($rpt in $reportsResp.value) {
-                        $allReportsForPicker += [pscustomobject]@{
-                            ReportId           = $rpt.id
-                            ReportName         = $rpt.name
-                            WorkspaceId        = $ws.id
-                            WorkspaceName      = $ws.name
-                            DatasetId          = $rpt.datasetId
-                            DatasetWorkspaceId = $rpt.datasetWorkspaceId
-                        }
-                    }
-                } catch { }
-            }
-            Write-Host ""
-            Write-Host "[INFO] Found $($allReportsForPicker.Count) reports across $($workspacesResponse.value.Count) workspaces."
+            # ---- Reports Mode: choose scope, optionally pick workspaces, then pick reports ----
+            # Each sub-dialog cancel steps back ONE level (instead of bouncing all the way out).
+            $reportSelectionComplete = $false
+            while (-not $reportSelectionComplete) {
 
-            # Show report picker
-            $selectedReports = Show-ReportPicker -Reports $allReportsForPicker
+                $reportScope = Show-ReportScopeDialog
 
-            if ($null -eq $selectedReports) {
-                # User cancelled — loop back to mode selector
-                Write-Host "[INFO] Report selection cancelled. Returning to run mode selection..."
-                $reportPickerCancelled = $true
-                continue
-            }
-
-            if ($selectedReports.Count -eq 0) {
-                throw "No reports selected."
-            }
-
-            # Determine workspace IDs needed: report workspaces + dataset workspaces for connected models
-            $neededWorkspaceIds = @()
-            $global:SelectedReportIds  = @{}
-            $global:SelectedDatasetIds = @{}
-
-            foreach ($rpt in $selectedReports) {
-                $global:SelectedReportIds[$rpt.ReportId] = $true
-                if ($rpt.WorkspaceId)  { $neededWorkspaceIds += $rpt.WorkspaceId }
-                if ($rpt.DatasetId)    { $global:SelectedDatasetIds[$rpt.DatasetId] = $true }
-
-                # If the dataset lives in a different workspace, include that workspace too
-                if ($rpt.DatasetWorkspaceId -and $rpt.DatasetWorkspaceId -ne $rpt.WorkspaceId) {
-                    $neededWorkspaceIds += $rpt.DatasetWorkspaceId
-                    Write-Host "[INFO] Report '$($rpt.ReportName)' uses a remote model in workspace $($rpt.DatasetWorkspaceId) - including that workspace."
+                if ($reportScope -eq 'Cancel') {
+                    # Step all the way back to the run-mode selector
+                    Write-Host "[INFO] Report scope selection cancelled. Returning to run mode selection..."
+                    $reportPickerCancelled = $true
+                    break
                 }
-            }
-            $neededWorkspaceIds = $neededWorkspaceIds | Select-Object -Unique
 
-            # Build workspacesInfo from needed workspaces
-            foreach ($workspace in $workspacesResponse.value) {
-                if ($neededWorkspaceIds -notcontains $workspace.id) { continue }
-                $workspacesInfo += Rename-Properties -object $workspace -renameMap $workspaceRenameMap
-            }
+                # Decide which workspaces to scan for reports
+                $workspacesToScan = $null
+                if ($reportScope -eq 'Specific') {
+                    # Pop the workspace chooser; Cancel returns to the scope question
+                    $scopeSelection = $null
+                    $scopeCancelled = $false
+                    try {
+                        $scopeSelection = Show-WorkspacePicker -Workspaces $workspacesResponse.value
+                    }
+                    catch {
+                        $scopeCancelled = $true
+                    }
+                    if ($scopeCancelled) {
+                        Write-Host "[INFO] Workspace selection cancelled. Returning to report scope selection..."
+                        continue
+                    }
 
-            if ($workspacesInfo.Count -eq 0) {
-                throw "No accessible workspaces found for the selected reports."
-            }
+                    $scopeWorkspaceIds = @($scopeSelection.SelectedWorkspaceIds)
+                    if (-not $scopeWorkspaceIds -or $scopeWorkspaceIds.Count -eq 0) {
+                        Write-Warning "No workspaces selected - showing reports from ALL workspaces instead."
+                        $workspacesToScan = $workspacesResponse.value
+                    } else {
+                        $workspacesToScan = @($workspacesResponse.value | Where-Object { $scopeWorkspaceIds -contains $_.id })
+                    }
+                }
+                else {
+                    # 'All' - scan every accessible workspace
+                    $workspacesToScan = $workspacesResponse.value
+                }
 
-            $IncludeMyWorkspace = $false
-            $global:RunMode = 'Reports'
+                # ---- Fetch reports from the chosen workspaces ----
+                Write-Host "[INFO] Fetching reports for selection..."
+                $allReportsForPicker = @()
+                $wsCount = 0
+                $wsTotal = @($workspacesToScan).Count
+                foreach ($ws in $workspacesToScan) {
+                    $wsCount++
+                    Write-Host "`r[INFO] Scanning workspace $wsCount of $($wsTotal): $($ws.name)" -NoNewline
+                    $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/reports"
+                    try {
+                        $reportsResp = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+                        foreach ($rpt in $reportsResp.value) {
+                            $allReportsForPicker += [pscustomobject]@{
+                                ReportId           = $rpt.id
+                                ReportName         = $rpt.name
+                                WorkspaceId        = $ws.id
+                                WorkspaceName      = $ws.name
+                                DatasetId          = $rpt.datasetId
+                                DatasetWorkspaceId = $rpt.datasetWorkspaceId
+                            }
+                        }
+                    } catch { }
+                }
+                Write-Host ""
+                Write-Host "[INFO] Found $($allReportsForPicker.Count) reports across $($wsTotal) workspace(s)."
+
+                if ($allReportsForPicker.Count -eq 0) {
+                    Write-Warning "No reports found in the selected workspace(s). Returning to report scope selection..."
+                    continue
+                }
+
+                # ---- Show report picker ----
+                $selectedReports = Show-ReportPicker -Reports $allReportsForPicker
+
+                if ($null -eq $selectedReports) {
+                    # User cancelled the report picker - back to the scope question
+                    Write-Host "[INFO] Report selection cancelled. Returning to report scope selection..."
+                    continue
+                }
+
+                if ($selectedReports.Count -eq 0) {
+                    Write-Warning "No reports selected. Returning to report scope selection..."
+                    continue
+                }
+
+                # Determine workspace IDs needed: report workspaces + dataset workspaces for connected models
+                $neededWorkspaceIds = @()
+                $global:SelectedReportIds  = @{}
+                $global:SelectedDatasetIds = @{}
+
+                foreach ($rpt in $selectedReports) {
+                    $global:SelectedReportIds[$rpt.ReportId] = $true
+                    if ($rpt.WorkspaceId)  { $neededWorkspaceIds += $rpt.WorkspaceId }
+                    if ($rpt.DatasetId)    { $global:SelectedDatasetIds[$rpt.DatasetId] = $true }
+
+                    # If the dataset lives in a different workspace, include that workspace too
+                    if ($rpt.DatasetWorkspaceId -and $rpt.DatasetWorkspaceId -ne $rpt.WorkspaceId) {
+                        $neededWorkspaceIds += $rpt.DatasetWorkspaceId
+                        Write-Host "[INFO] Report '$($rpt.ReportName)' uses a remote model in workspace $($rpt.DatasetWorkspaceId) - including that workspace."
+                    }
+                }
+                $neededWorkspaceIds = $neededWorkspaceIds | Select-Object -Unique
+
+                # Build workspacesInfo from needed workspaces
+                foreach ($workspace in $workspacesResponse.value) {
+                    if ($neededWorkspaceIds -notcontains $workspace.id) { continue }
+                    $workspacesInfo += Rename-Properties -object $workspace -renameMap $workspaceRenameMap
+                }
+
+                if ($workspacesInfo.Count -eq 0) {
+                    Write-Warning "No accessible workspaces found for the selected reports. Returning to report scope selection..."
+                    continue
+                }
+
+                $IncludeMyWorkspace = $false
+                $global:RunMode = 'Reports'
+                $reportSelectionComplete = $true
+            } # end inner while (report selection)
+
+            # If the user backed all the way out, re-show the run-mode selector
+            if ($reportPickerCancelled) { continue }
 
         } else {
             # ---- Workspaces Mode: existing behavior ----
@@ -3069,9 +3185,187 @@ function Export-ReportUsingAPI {
             -Headers @{ Authorization = "Bearer $accessToken" } `
             -Method GET `
             -OutFile $OutFilePath
+        # Treat as success only if a non-empty file was actually written
+        if ((Test-Path $OutFilePath) -and ((Get-Item $OutFilePath).Length -gt 0)) {
+            return $true
+        }
+        return $false
     } catch {
-        
+        return $false
     }
+}
+
+# Function to Export a Report's PBIR Definition via the Fabric Definition API,
+# then zip the returned parts and rename the archive to .pbix.
+# NOTE: A zipped PBIR definition renamed to .pbix is NOT an openable Power BI
+# Desktop file by design - it is produced this way intentionally.
+# Used ONLY as a fallback when the standard LiveConnect export fails.
+# Written for Windows PowerShell 5.1 compatibility.
+function Export-ReportDefinitionAsPbix {
+    param (
+        [string]$WorkspaceId,
+        [string]$ReportId,
+        [string]$OutFilePath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+
+    $accessToken = Get-CurrentAccessToken
+    $headers = @{ Authorization = "Bearer $accessToken"; 'Content-Type' = 'application/json' }
+    $defUrl  = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$WorkspaceId/reports/$ReportId/getDefinition"
+
+    try {
+        $resp = Invoke-WebRequest -Uri $defUrl -Method POST -Headers $headers -Body '{}' -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-Warning "getDefinition failed for report $ReportId : $($_.Exception.Message)"
+        return $false
+    }
+
+    $definition = $null
+    $statusCode = [int]$resp.StatusCode
+
+    if ($statusCode -eq 200) {
+        $definition = $resp.Content | ConvertFrom-Json
+    }
+    elseif ($statusCode -eq 202) {
+        # Long-running operation: poll the operation until it completes, then fetch the result
+        $opUrl = $resp.Headers['Location']
+        if ($opUrl -is [array]) { $opUrl = $opUrl[0] }
+        $retry = 2
+        if ($resp.Headers['Retry-After']) { $retry = [int]($resp.Headers['Retry-After'] | Select-Object -First 1) }
+
+        while ($true) {
+            Start-Sleep -Seconds $retry
+            try {
+                $op = Invoke-WebRequest -Uri $opUrl -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
+            } catch {
+                Write-Warning "Polling definition op failed for report $ReportId : $($_.Exception.Message)"
+                return $false
+            }
+            $status = ($op.Content | ConvertFrom-Json).status
+            if ($status -eq 'Succeeded') { break }
+            if ($status -eq 'Failed')    { Write-Warning "Definition operation failed for report $ReportId"; return $false }
+            if ($op.Headers['Retry-After']) { $retry = [int]($op.Headers['Retry-After'] | Select-Object -First 1) }
+        }
+
+        $resultUrl = ($opUrl.TrimEnd('/')) + '/result'
+        try {
+            $result = Invoke-WebRequest -Uri $resultUrl -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Write-Warning "Fetching definition result failed for report $ReportId : $($_.Exception.Message)"
+            return $false
+        }
+        $definition = $result.Content | ConvertFrom-Json
+    }
+    else {
+        Write-Warning "Unexpected status $statusCode from getDefinition for report $ReportId"
+        return $false
+    }
+
+    if (-not $definition.definition.parts) {
+        Write-Warning "No definition parts returned for report $ReportId"
+        return $false
+    }
+
+    # Stage the parts into a temp folder.
+    # NOTE: getDefinition returns part paths WITHOUT a "Report/" prefix
+    # (e.g. "definition/report.json"), but the PBIX/PBIR layout expected by the
+    # Report Detail extractor is "Report/definition/...". Nest everything under
+    # a "Report" folder so the zipped .pbix matches that structure.
+    $stageDir = Join-Path $env:TEMP ("ReportDef_" + $ReportId)
+    if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+    $reportRoot = Join-Path $stageDir 'Report'
+    New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
+
+    foreach ($part in $definition.definition.parts) {
+        $partPath = Join-Path $reportRoot $part.path
+        $partDir  = Split-Path $partPath -Parent
+        if (-not (Test-Path $partDir)) { New-Item -ItemType Directory -Path $partDir -Force | Out-Null }
+        if ($part.payloadType -eq 'InlineBase64') {
+            [System.IO.File]::WriteAllBytes($partPath, [System.Convert]::FromBase64String($part.payload))
+        } else {
+            [System.IO.File]::WriteAllText($partPath, [string]$part.payload)
+        }
+    }
+
+    # If getDefinition returned the legacy (non-PBIR) layout, there is NO
+    # "definition" folder - instead a root-level "report.json" carries the
+    # report layout. Rename it to "Layout" (no extension) AND re-encode it as
+    # UTF-16 LE (no BOM) to match the classic PBIX layout the downstream
+    # extractor expects. getDefinition returns report.json as UTF-8, but a real
+    # PBIX "Report/Layout" is UTF-16 LE; without this conversion the parser
+    # reads garbage and fails.
+    $defFolder = Join-Path $reportRoot 'definition'
+    if (-not (Test-Path $defFolder)) {
+        $reportJson = Join-Path $reportRoot 'report.json'
+        if (Test-Path $reportJson) {
+            $layoutPath = Join-Path $reportRoot 'Layout'
+            if (Test-Path $layoutPath) { Remove-Item $layoutPath -Force }
+            $layoutText = [System.IO.File]::ReadAllText($reportJson, [System.Text.Encoding]::UTF8)
+            $utf16NoBom = New-Object System.Text.UnicodeEncoding($false, $false)  # LE, no BOM
+            [System.IO.File]::WriteAllText($layoutPath, $layoutText, $utf16NoBom)
+            Remove-Item $reportJson -Force
+        }
+    }
+
+    # getDefinition does NOT return a "Connections" file, but the downstream
+    # Report Detail extractor expects one at the ROOT (alongside the "Report"
+    # folder) to populate the Connections sheet + ModelID/ReportID. Synthesize
+    # it from definition.pbir's datasetReference so the layout matches a PBIX.
+    $pbirPath = Join-Path $reportRoot 'definition.pbir'
+    if (Test-Path $pbirPath) {
+        try {
+            $pbir  = Get-Content -Path $pbirPath -Raw | ConvertFrom-Json
+            $dsRef = $pbir.datasetReference
+            $connString = $null
+            $datasetId  = ''
+
+            if ($dsRef.byConnection -and $dsRef.byConnection.connectionString) {
+                $connString = $dsRef.byConnection.connectionString
+                $m = [regex]::Match($connString, 'semanticmodelid=([0-9a-fA-F-]+)')
+                if ($m.Success) { $datasetId = $m.Groups[1].Value }
+            }
+            elseif ($dsRef.byPath -and $dsRef.byPath.path) {
+                $connString = 'byPath:' + $dsRef.byPath.path
+            }
+
+            if ($connString) {
+                $connObj = [pscustomobject]@{
+                    Version     = '3.0'
+                    Connections = @(
+                        [pscustomobject]@{
+                            Name             = 'EntityDataSource'
+                            ConnectionString = $connString
+                            ConnectionType   = 'pbiServiceLive'
+                        }
+                    )
+                    RemoteArtifacts = @(
+                        [pscustomobject]@{
+                            DatasetId = $datasetId
+                            ReportId  = $ReportId
+                        }
+                    )
+                }
+                # Root-level file literally named "Connections" (no extension) to match PBIX
+                $connJson = $connObj | ConvertTo-Json -Depth 6 -Compress
+                [System.IO.File]::WriteAllText((Join-Path $stageDir 'Connections'), $connJson)
+            }
+        } catch {
+            Write-Warning "Could not synthesize Connections file for report $ReportId : $($_.Exception.Message)"
+        }
+    }
+
+    # Zip the staged folder, then rename the archive to .pbix
+    if (Test-Path $OutFilePath) { Remove-Item $OutFilePath -Force }
+    $tempZip = Join-Path $env:TEMP ("ReportDef_" + $ReportId + ".zip")
+    if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
+
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($stageDir, $tempZip)
+    Move-Item -Path $tempZip -Destination $OutFilePath -Force
+
+    Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    return $true
 }
 
 	# -------------------
@@ -3131,11 +3425,23 @@ function Export-ReportUsingAPI {
 	
 	        # Export based on Workspace Type
 	        if ($workspace.WorkspaceIsOnDedicatedCapacity -eq $false) {
-	            # Pro Workspace → IncludeModel
-	            Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "IncludeModel"
+	            # Pro Workspace → IncludeModel (real .pbix, used for model extraction below)
+	            $null = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "IncludeModel"
+	        } elseif ($fileExtension -eq 'pbix') {
+	            # Non-Pro PBIX report (Premium / Fabric / etc.) → LiveConnect by default.
+	            # Only if LiveConnect fails do we fall back to the getDefinition export
+	            # (a zipped PBIR definition renamed to .pbix - intentional).
+	            $liveExported = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	            if (-not $liveExported) {
+	                Write-Warning "LiveConnect export failed for $cleanWorkspaceName ~ $cleanReportName; falling back to getDefinition."
+	                $defExported = Export-ReportDefinitionAsPbix -WorkspaceId $workspaceId -ReportId $reportId -OutFilePath $filepath
+	                if (-not $defExported) {
+	                    Write-Warning "getDefinition export also failed for $cleanWorkspaceName ~ $cleanReportName."
+	                }
+	            }
 	        } else {
-	            # Premium/Fabric Workspace → LiveConnect
-	            Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	            # Non-Pro paginated (RDL) report → LiveConnect export
+	            $null = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
 	        }
 			
 		# Only process model extraction for Pro Workspaces
