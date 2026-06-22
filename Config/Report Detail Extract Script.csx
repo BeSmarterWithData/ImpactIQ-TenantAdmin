@@ -970,6 +970,10 @@ catch (Exception ex)
                 visualName = visualType;
             }
 
+            // Capture the starting index so the visual's name can be applied to
+            // every VisualObject added for this visual below.
+            int voStartIndex = VisualObjects.Count;
+
             // Visual Hidden
             try
             {
@@ -2495,6 +2499,12 @@ catch (Exception ex)
             }
             catch
             {
+            }
+
+            // Apply the visual's name to every VisualObject captured for this visual
+            for (int voIdx = voStartIndex; voIdx < VisualObjects.Count; voIdx++)
+            {
+                VisualObjects[voIdx].VisualName = visualName;
             }
 
             Visuals.Add(new Visual {
