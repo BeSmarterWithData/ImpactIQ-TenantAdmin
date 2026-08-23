@@ -121,13 +121,13 @@ if ($psGetVer -lt [version]'2.0.0') {
 
 # Ensure required modules are installed, and imports them. If import fails, error and exit early
 $requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt' )
+$requiredModules += 'Az.Accounts'
 foreach ($module in $requiredModules) {
     if (-not (Import-Module $module -PassThru -EA Ignore)) {
         Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck
     }
     Import-Module $module -ErrorAction 'Stop'
 }
-
 
 # ================================
 # Read-Host With 60 Second Timeout
@@ -447,6 +447,62 @@ function Get-CurrentAccessToken {
     }
 }
 
+function Get-FabricAccessToken {
+    param([switch]$ForceLogin)
+
+    $azEnvironment = switch ($EnvironmentForEndpoints) {
+        'China' { 'AzureChinaCloud' }
+        'USGov' { 'AzureUSGovernment' }
+        'USGovHigh' { 'AzureUSGovernment' }
+        'USGovMil' { 'AzureUSGovernment' }
+        default { 'AzureCloud' }
+    }
+
+    $azContext = Get-AzContext -ErrorAction SilentlyContinue
+    if ($ForceLogin -or -not $azContext -or $azContext.Environment.Name -ne $azEnvironment) {
+        Write-Host "[INFO] Connecting to Microsoft Fabric..." -ForegroundColor Cyan
+        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+    }
+
+    try {
+        $tokenValue = (Get-AzAccessToken -ResourceUrl $global:PowerBIEndpoints.FabricApiPrefix -ErrorAction Stop).Token
+    } catch {
+        if ($ForceLogin) { throw }
+        return Get-FabricAccessToken -ForceLogin
+    }
+
+    if ($tokenValue -is [System.Security.SecureString]) {
+        $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenValue)
+    } else {
+        return [string]$tokenValue
+    }
+
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
+    }
+}
+
+function Invoke-FabricPagedGet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+        [Parameter(Mandatory = $true)]
+        [string]$AccessToken
+    )
+
+    $results = @()
+    $nextUrl = $Url
+    while ($nextUrl) {
+        $headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json' }
+        $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET -ErrorAction Stop
+        if ($response.value) { $results += @($response.value) }
+        $nextUrl = if ($response.continuationUri) { $response.continuationUri } else { $null }
+    }
+    return $results
+}
+
 # Create a variable date
 $date = (Get-Date -UFormat "%Y-%m-%d")
 
@@ -688,7 +744,7 @@ function Show-RunModeDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "ImpactIQ - Select Run Mode"
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(440, 210)
+    $form.Size = New-Object System.Drawing.Size(440, 260)
     $form.TopMost = $true
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
@@ -718,6 +774,16 @@ function Show-RunModeDialog {
         $form.Close()
     })
     $form.Controls.Add($btnReports)
+
+    $btnModels = New-Object System.Windows.Forms.Button
+    $btnModels.Text = "Run against specific models"
+    $btnModels.Size = New-Object System.Drawing.Size(380, 40)
+    $btnModels.Location = New-Object System.Drawing.Point(20, 160)
+    $btnModels.Add_Click({
+        $form.Tag = 'Models'
+        $form.Close()
+    })
+    $form.Controls.Add($btnModels)
 
     $form.Add_FormClosing({
         param($sender, $e)
@@ -959,6 +1025,294 @@ function Show-ReportPicker {
     $selectedReports = @($allReportItems | Where-Object { $selectedReportIds -contains $_.ReportId })
 
     return $selectedReports
+}
+
+# ================================
+# Show Model Scope Selection Dialog
+# ================================
+function Show-ModelScopeDialog {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "ImpactIQ - Model Selection Scope"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(440, 250)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Which models would you like to choose from?"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $form.Controls.Add($label)
+
+    $btnAll = New-Object System.Windows.Forms.Button
+    $btnAll.Text = "Models from ALL workspaces"
+    $btnAll.Size = New-Object System.Drawing.Size(380, 40)
+    $btnAll.Location = New-Object System.Drawing.Point(20, 55)
+    $btnAll.Add_Click({ $form.Tag = 'All'; $form.Close() })
+    $form.Controls.Add($btnAll)
+
+    $btnSpecific = New-Object System.Windows.Forms.Button
+    $btnSpecific.Text = "Models from specific workspace(s)"
+    $btnSpecific.Size = New-Object System.Drawing.Size(380, 40)
+    $btnSpecific.Location = New-Object System.Drawing.Point(20, 105)
+    $btnSpecific.Add_Click({ $form.Tag = 'Specific'; $form.Close() })
+    $form.Controls.Add($btnSpecific)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Size = New-Object System.Drawing.Size(380, 30)
+    $btnCancel.Location = New-Object System.Drawing.Point(20, 155)
+    $btnCancel.Add_Click({ $form.Tag = 'Cancel'; $form.Close() })
+    $form.Controls.Add($btnCancel)
+
+    $form.Add_FormClosing({
+        param($sender, $e)
+        if (-not $form.Tag) { $form.Tag = 'Cancel' }
+    })
+
+    [void]$form.ShowDialog()
+    return $form.Tag
+}
+
+# ================================
+# Show Model Picker Dialog
+# ================================
+function Show-ModelPicker {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Models
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Models"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(650,580)
+    $form.TopMost = $true
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Select the models to run against (reports using these models will be included automatically):"
+    $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point(12,12)
+    $form.Controls.Add($lbl)
+
+    $lblSearch = New-Object System.Windows.Forms.Label
+    $lblSearch.Text = "Search:"
+    $lblSearch.AutoSize = $true
+    $lblSearch.Location = New-Object System.Drawing.Point(12,40)
+    $form.Controls.Add($lblSearch)
+
+    $txtSearch = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Location = New-Object System.Drawing.Point(70,37)
+    $txtSearch.Size = New-Object System.Drawing.Size(552,23)
+    $form.Controls.Add($txtSearch)
+
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location = New-Object System.Drawing.Point(12,70)
+    $clb.Size = New-Object System.Drawing.Size(610,380)
+    $clb.CheckOnClick = $true
+    $clb.Sorted = $true
+
+    $allModelItems = @()
+    foreach ($model in $Models) {
+        $display = "{0} - {1} ({2})" -f $model.WorkspaceName, $model.DatasetName, $model.DatasetId
+        $item = [pscustomobject]@{
+            Display = $display
+            DatasetId = $model.DatasetId
+            DatasetName = $model.DatasetName
+            WorkspaceId = $model.WorkspaceId
+            WorkspaceName = $model.WorkspaceName
+        }
+        $item | Add-Member -MemberType ScriptMethod -Name ToString -Value { $this.Display } -Force
+        $allModelItems += $item
+    }
+
+    $persistentCheckedIds = @{}
+    foreach ($item in $allModelItems) { [void]$clb.Items.Add($item) }
+    $clb.DisplayMember = 'Display'
+    $form.Controls.Add($clb)
+
+    $clb.Add_ItemCheck({
+        param($sender, $e)
+        $item = $clb.Items[$e.Index]
+        if ($e.NewValue -eq 'Checked') {
+            $persistentCheckedIds[$item.DatasetId] = $true
+        } elseif ($e.NewValue -eq 'Unchecked') {
+            $persistentCheckedIds.Remove($item.DatasetId)
+        }
+    })
+
+    $txtSearch.Add_TextChanged({
+        $searchText = $txtSearch.Text
+        $clb.BeginUpdate()
+        $clb.Items.Clear()
+        $escapedSearchText = [regex]::Escape($searchText)
+        foreach ($item in $allModelItems) {
+            if ([string]::IsNullOrWhiteSpace($searchText) -or $item.Display -imatch $escapedSearchText) {
+                $index = $clb.Items.Add($item)
+                if ($persistentCheckedIds.ContainsKey($item.DatasetId)) { $clb.SetItemChecked($index, $true) }
+            }
+        }
+        $clb.EndUpdate()
+    })
+
+    $chkAll = New-Object System.Windows.Forms.CheckBox
+    $chkAll.Text = "Select All"
+    $chkAll.AutoSize = $true
+    $chkAll.Location = New-Object System.Drawing.Point(12,460)
+    $chkAll.Add_CheckedChanged({
+        for ($index = 0; $index -lt $clb.Items.Count; $index++) { $clb.SetItemChecked($index, $chkAll.Checked) }
+    })
+    $form.Controls.Add($chkAll)
+
+    $btnClearAll = New-Object System.Windows.Forms.Button
+    $btnClearAll.Text = "Clear All"
+    $btnClearAll.Width = 80
+    $btnClearAll.Location = New-Object System.Drawing.Point(100,458)
+    $btnClearAll.Add_Click({
+        for ($index = 0; $index -lt $clb.Items.Count; $index++) { $clb.SetItemChecked($index, $false) }
+        $chkAll.Checked = $false
+    })
+    $form.Controls.Add($btnClearAll)
+
+    $okBtn = New-Object System.Windows.Forms.Button
+    $okBtn.Text = "OK"
+    $okBtn.Width = 100
+    $okBtn.Location = New-Object System.Drawing.Point(416,500)
+    $okBtn.Add_Click({ $form.Tag = 'OK'; $form.Close() })
+    $form.Controls.Add($okBtn)
+
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = "Cancel"
+    $cancelBtn.Width = 100
+    $cancelBtn.Location = New-Object System.Drawing.Point(522,500)
+    $cancelBtn.Add_Click({ $form.Tag = 'Cancel'; $form.Close() })
+    $form.Controls.Add($cancelBtn)
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 120000
+    $timer.Add_Tick({ $timer.Stop(); $form.Tag = 'Timeout'; $form.Close() })
+    $timer.Start()
+
+    $form.AcceptButton = $okBtn
+    $form.CancelButton = $cancelBtn
+    [void]$form.ShowDialog()
+
+    if ($form.Tag -eq 'Cancel') { return $null }
+
+    $selectedDatasetIds = @($persistentCheckedIds.Keys)
+    return @($allModelItems | Where-Object { $selectedDatasetIds -contains $_.DatasetId })
+}
+
+function Select-ModelRunScope {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Workspaces,
+        [switch]$UseAdminApi
+    )
+
+    while ($true) {
+    $modelScope = Show-ModelScopeDialog
+    if ($modelScope -eq 'Cancel') { return $null }
+
+    $workspacesToScan = $Workspaces
+    if ($modelScope -eq 'Specific') {
+        try {
+            $scopeSelection = Show-WorkspacePicker -Workspaces $Workspaces
+        } catch {
+            Write-Host "[INFO] Workspace selection cancelled. Returning to model scope selection..."
+            continue
+        }
+
+        $scopeWorkspaceIds = @($scopeSelection.SelectedWorkspaceIds)
+        if ($scopeWorkspaceIds.Count -gt 0) {
+            $workspacesToScan = @($Workspaces | Where-Object { $scopeWorkspaceIds -contains $_.id })
+        }
+    }
+
+    Write-Host "[INFO] Fetching models for selection..."
+    $allModelsForPicker = @()
+    $workspaceIndex = 0
+    foreach ($workspace in $workspacesToScan) {
+        $workspaceIndex++
+        Write-Host "`r[INFO] Scanning workspace $workspaceIndex of $(@($workspacesToScan).Count): $($workspace.name)" -NoNewline
+        $datasetsUrl = if ($UseAdminApi) {
+            "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$($workspace.id)/datasets"
+        } else {
+            "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.id)/datasets"
+        }
+
+        try {
+            $datasetsResponse = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
+            foreach ($dataset in $datasetsResponse.value) {
+                $allModelsForPicker += [pscustomobject]@{
+                    DatasetId = $dataset.id
+                    DatasetName = $dataset.name
+                    WorkspaceId = $workspace.id
+                    WorkspaceName = $workspace.name
+                }
+            }
+        } catch { }
+    }
+    Write-Host ""
+    Write-Host "[INFO] Found $($allModelsForPicker.Count) model(s) across $(@($workspacesToScan).Count) workspace(s)."
+
+    if ($allModelsForPicker.Count -eq 0) {
+        Write-Warning "No models found in the selected workspace scope. Returning to model scope selection..."
+        continue
+    }
+
+    $selectedModels = Show-ModelPicker -Models $allModelsForPicker
+    if ($null -eq $selectedModels) {
+        Write-Host "[INFO] Model selection cancelled. Returning to model scope selection..."
+        continue
+    }
+    if ($selectedModels.Count -eq 0) {
+        Write-Warning "No models selected. Returning to model scope selection..."
+        continue
+    }
+
+    $selectedDatasetIds = @{}
+    $selectedReportIds = @{}
+    $neededWorkspaceIds = @($selectedModels | ForEach-Object { $_.WorkspaceId })
+    foreach ($model in $selectedModels) { $selectedDatasetIds[$model.DatasetId] = $true }
+
+    Write-Host "[INFO] Finding reports connected to the selected model(s)..."
+    $workspaceIndex = 0
+    foreach ($workspace in $Workspaces) {
+        $workspaceIndex++
+        Write-Host "`r[INFO] Scanning workspace $workspaceIndex of $($Workspaces.Count): $($workspace.name)" -NoNewline
+        $reportsUrl = if ($UseAdminApi) {
+            "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$($workspace.id)/reports"
+        } else {
+            "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.id)/reports"
+        }
+
+        try {
+            $reportsResponse = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+            foreach ($report in $reportsResponse.value) {
+                if ($report.datasetId -and $selectedDatasetIds.ContainsKey($report.datasetId)) {
+                    $selectedReportIds[$report.id] = $true
+                    $neededWorkspaceIds += $workspace.id
+                }
+            }
+        } catch { }
+    }
+    Write-Host ""
+
+    return [pscustomobject]@{
+        SelectedModels = @($selectedModels)
+        SelectedDatasetIds = $selectedDatasetIds
+        SelectedReportIds = $selectedReportIds
+        NeededWorkspaceIds = @($neededWorkspaceIds | Select-Object -Unique)
+    }
+    }
 }
 
 
@@ -1596,6 +1950,10 @@ $workspacesInfo = @()
 $usingAdminAPI = $false
 $userChoiceForceUserMode = $false
 $hasAdminAccess = $false
+$global:RunMode = $null
+$global:SelectedDatasetIds = @{}
+$global:SelectedReportIds = @{}
+$global:SelectedDataflowIds = @{}
 
 Write-Host "[INFO] Attempting to use Admin API to discover all tenant workspaces..."
 
@@ -1691,17 +2049,22 @@ if ($hasAdminAccess) {
     }
 }
 
-# Initialize run mode (default to Workspaces unless already set to Reports by AdminReports choice)
+# Initialize run mode (default to Workspaces unless already set by a role shortcut)
 if (-not $global:RunMode) { $global:RunMode = 'Workspaces' }
 
-# --- For non-admin users or admin users who chose 'User' role, show Run Mode Dialog ---
-if (-not $hasAdminAccess -or $userChoiceForceUserMode) {
+# All role levels choose a workspace, report, or model perspective. AdminReports remains a direct shortcut.
+if ($roleChoice -ne 'AdminReports') {
     $reportPickerCancelled = $true
     while ($reportPickerCancelled) {
         $reportPickerCancelled = $false
         $runMode = Show-RunModeDialog
 
         if ($runMode -eq 'Reports') {
+            if ($isTenantAdminMode) {
+                $global:RunMode = 'Reports'
+                break
+            }
+
             # ---- Reports Mode: choose scope, optionally pick workspaces, then pick reports ----
             # Each sub-dialog cancel steps back ONE level (instead of bouncing all the way out).
             $reportSelectionComplete = $false
@@ -1754,7 +2117,11 @@ if (-not $hasAdminAccess -or $userChoiceForceUserMode) {
                 foreach ($ws in $workspacesToScan) {
                     $wsCount++
                     Write-Host "`r[INFO] Scanning workspace $wsCount of $($wsTotal): $($ws.name)" -NoNewline
-                    $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/reports"
+                    $reportsUrl = if ($usingAdminAPI) {
+                        "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$($ws.id)/reports"
+                    } else {
+                        "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/reports"
+                    }
                     try {
                         $reportsResp = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
                         foreach ($rpt in $reportsResp.value) {
@@ -1828,6 +2195,32 @@ if (-not $hasAdminAccess -or $userChoiceForceUserMode) {
             # If the user backed all the way out, re-show the run-mode selector
             if ($reportPickerCancelled) { continue }
 
+        } elseif ($runMode -eq 'Models') {
+            $modelSelection = Select-ModelRunScope -Workspaces @($workspacesResponse.value) -UseAdminApi:$usingAdminAPI
+            if ($null -eq $modelSelection) {
+                Write-Host "[INFO] Model selection cancelled. Returning to run mode selection..."
+                $reportPickerCancelled = $true
+                continue
+            }
+
+            $global:SelectedDatasetIds = $modelSelection.SelectedDatasetIds
+            $global:SelectedReportIds = $modelSelection.SelectedReportIds
+            $selectedWorkspaceIds = @($modelSelection.NeededWorkspaceIds)
+            foreach ($workspace in $workspacesResponse.value) {
+                if ($selectedWorkspaceIds -notcontains $workspace.id) { continue }
+                $workspacesInfo += Rename-Properties -object $workspace -renameMap $workspaceRenameMap
+            }
+
+            if ($workspacesInfo.Count -eq 0) {
+                Write-Warning "No workspaces found for the selected models. Returning to run mode selection..."
+                $reportPickerCancelled = $true
+                continue
+            }
+
+            $IncludeMyWorkspace = $false
+            $global:RunMode = 'Models'
+            Write-Host "[INFO] Models mode: will process $($modelSelection.SelectedModels.Count) model(s), $($global:SelectedReportIds.Count) connected report(s), and $($workspacesInfo.Count) workspace(s)."
+
         } else {
             # ---- Workspaces Mode: existing behavior ----
             $global:RunMode = 'Workspaces'
@@ -1835,8 +2228,8 @@ if (-not $hasAdminAccess -or $userChoiceForceUserMode) {
     }
 }
 
-# --- For Admin Reports mode, fetch reports using admin API from all tenant workspaces ---
-if ($global:RunMode -eq 'Reports' -and $hasAdminAccess -and -not $userChoiceForceUserMode) {
+# --- For Tenant Admin Reports mode, fetch reports using admin API from all tenant workspaces ---
+if ($global:RunMode -eq 'Reports' -and $isTenantAdminMode) {
     $reportPickerCancelled = $true
     while ($reportPickerCancelled) {
         $reportPickerCancelled = $false
@@ -1915,7 +2308,7 @@ if ($global:RunMode -eq 'Reports' -and $hasAdminAccess -and -not $userChoiceForc
 }
 
 # --- Workspace mode flow (existing behavior) ---
-if ($global:RunMode -ne 'Reports') {
+if ($global:RunMode -notin @('Reports', 'Models')) {
 
 # --- Filter Personal/PersonalGroup workspaces from picker ---
 # These workspace types don't support elevated permissions or backups
@@ -1963,10 +2356,10 @@ if (($allNonPersonalSelected -or $selection.TimedOut) -and $personalWorkspaces.C
 # Flag for later "My Workspace" section
 $IncludeMyWorkspace = $selection.IncludeMyWorkspace
 
-} # end if ($global:RunMode -ne 'Reports')
+} # end workspace mode
 
-# Ensure variables used later are initialized for Reports mode
-if ($global:RunMode -eq 'Reports') {
+# Ensure variables used later are initialized for report/model perspectives
+if ($global:RunMode -in @('Reports', 'Models')) {
     if (-not $personalWorkspaces)      { $personalWorkspaces = @() }
     if (-not $allNonPersonalSelected)  { $allNonPersonalSelected = $false }
     if (-not $IncludeMyWorkspace)      { $IncludeMyWorkspace = $false }
@@ -2114,6 +2507,9 @@ if ($isTenantAdminMode) {
 
 # Initialize collections for all necessary information
 $fabricItemsInfo = @()
+$connectionsInfo = @()
+$gatewaysInfo = @()
+$itemConnectionsInfo = @()
 $datasetsInfo = @()
 $datasetSourcesInfo = @()
 $dataflowsInfo = @()
@@ -2128,6 +2524,48 @@ $dataflowNameLookup = @{}
 $datasetRefreshHistory = @()
 $datasetRefreshSchedule = @()
 $dataflowRefreshHistory = @()
+
+try {
+    Write-Output "Fabric connection metadata extraction process started."
+    $fabricAccessToken = Get-FabricAccessToken
+    $connectionsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/connections"
+    foreach ($connection in (Invoke-FabricPagedGet -Url $connectionsUrl -AccessToken $fabricAccessToken)) {
+        $connectionsInfo += [PSCustomObject]@{
+            ConnectionId = $connection.id; ConnectionName = $connection.displayName; GatewayId = $connection.gatewayId
+            ConnectivityType = $connection.connectivityType; ConnectionType = $connection.connectionDetails.type
+            ConnectionPath = $connection.connectionDetails.path; PrivacyLevel = $connection.privacyLevel
+            CredentialType = $connection.credentialDetails.credentialType; SingleSignOnType = $connection.credentialDetails.singleSignOnType
+            ConnectionEncryption = $connection.credentialDetails.connectionEncryption; SkipTestConnection = $connection.credentialDetails.skipTestConnection
+            AllowConnectionUsageInGateway = $connection.allowConnectionUsageInGateway; AllowUsageInUserControlledCode = $connection.allowUsageInUserControlledCode
+            CreatedDateTime = $connection.connectionRecency.createdDateTime; LastBoundDateTime = $connection.connectionRecency.lastBoundDateTime
+            LastCredentialUsedDateTime = $connection.connectionRecency.lastCredentialUsedDateTime; MyLastBoundDateTime = $connection.connectionRecency.myLastBoundDateTime
+            MyLastCredentialUsedDateTime = $connection.connectionRecency.myLastCredentialUsedDateTime
+        }
+    }
+    Write-Output "Fabric connection metadata extraction process completed. Found $($connectionsInfo.Count) connection(s)."
+} catch {
+    Write-Host "[WARN] Fabric List Connections failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+try {
+    Write-Output "Fabric gateway metadata extraction process started."
+    if (-not $fabricAccessToken) { $fabricAccessToken = Get-FabricAccessToken }
+    $gatewaysUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/gateways"
+    foreach ($gateway in (Invoke-FabricPagedGet -Url $gatewaysUrl -AccessToken $fabricAccessToken)) {
+        $gatewaysInfo += [PSCustomObject]@{
+            GatewayId = $gateway.id; GatewayName = $gateway.displayName; GatewayType = $gateway.type; GatewayVersion = $gateway.version
+            CapacityId = $gateway.capacityId; NumberOfMemberGateways = $gateway.numberOfMemberGateways
+            MinMemberGatewayCount = $gateway.minMemberGatewayCount; MaxMemberGatewayCount = $gateway.maxMemberGatewayCount
+            LoadBalancingSetting = $gateway.loadBalancingSetting; AllowCloudConnectionRefresh = $gateway.allowCloudConnectionRefresh
+            AllowCustomConnectors = $gateway.allowCustomConnectors; InactivityMinutesBeforeSleep = $gateway.inactivityMinutesBeforeSleep
+            SubscriptionId = $gateway.virtualNetworkAzureResource.subscriptionId; ResourceGroupName = $gateway.virtualNetworkAzureResource.resourceGroupName
+            VirtualNetworkName = $gateway.virtualNetworkAzureResource.virtualNetworkName; SubnetName = $gateway.virtualNetworkAzureResource.subnetName
+        }
+    }
+    Write-Output "Fabric gateway metadata extraction process completed. Found $($gatewaysInfo.Count) gateway(s)."
+} catch {
+    Write-Host "[WARN] Fabric List Gateways failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 
 # Initialize new user permission collections
 $datasetUsers = @()
@@ -2269,6 +2707,16 @@ if ($global:RunMode -eq 'Reports') {
     Write-Host "[INFO] Filtered to $($reportsInfo.Count) report(s) and $($datasetsInfo.Count) model(s)."
 }
 
+# When running from the model perspective, retain selected models and every report connected to them.
+if ($global:RunMode -eq 'Models') {
+    Write-Host "[INFO] Filtering results to selected models and connected reports..."
+    $datasetsInfo       = @($datasetsInfo       | Where-Object { $global:SelectedDatasetIds.ContainsKey($_.DatasetId) })
+    $datasetSourcesInfo = @($datasetSourcesInfo | Where-Object { $global:SelectedDatasetIds.ContainsKey($_.DatasetId) })
+    $reportsInfo        = @($reportsInfo        | Where-Object { $global:SelectedReportIds.ContainsKey($_.ReportId) })
+    $reportPagesInfo    = @($reportPagesInfo    | Where-Object { $global:SelectedReportIds.ContainsKey($_.ReportId) })
+    Write-Host "[INFO] Filtered to $($datasetsInfo.Count) model(s) and $($reportsInfo.Count) connected report(s)."
+}
+
 # Fetch Apps and App Reports that are in filtered workspaces (no comprehensive admin API, use regular - but we can use admin to list)
 # Note: We'll use the admin apps endpoint but still need regular API for app details
 try {
@@ -2306,6 +2754,12 @@ foreach ($app in $apps.value) {
             $originalReportObjectIds[$report.originalReportObjectId] = $true
         }
     }
+}
+
+if ($global:RunMode -eq 'Models') {
+    $reportsInAppInfo = @($reportsInAppInfo | Where-Object { $global:SelectedReportIds.ContainsKey($_.ReportId) })
+    $selectedAppIds = @($reportsInAppInfo | ForEach-Object { $_.AppId } | Select-Object -Unique)
+    $appsInfo = @($appsInfo | Where-Object { $selectedAppIds -contains $_.AppId })
 }
 
 # Fetch Refresh History for Datasets
@@ -2544,6 +2998,17 @@ foreach ($workspace in $workspacesInfo) {
     }
 
 # Fetch Dataflow Refresh History
+if ($global:RunMode -eq 'Models') {
+    $dataflowLineage = @($dataflowLineage | Where-Object { $global:SelectedDatasetIds.ContainsKey($_.DatasetId) })
+    $global:SelectedDataflowIds = @{}
+    foreach ($lineageRecord in $dataflowLineage) {
+        if ($lineageRecord.DataflowId) { $global:SelectedDataflowIds[$lineageRecord.DataflowId] = $true }
+    }
+    $dataflowsInfo = @($dataflowsInfo | Where-Object { $global:SelectedDataflowIds.ContainsKey($_.DataflowId) })
+    $dataflowSourcesInfo = @($dataflowSourcesInfo | Where-Object { $global:SelectedDataflowIds.ContainsKey($_.DataflowId) })
+    Write-Host "[INFO] Model lineage includes $($dataflowsInfo.Count) upstream dataflow(s)."
+}
+
 foreach ($workspace in $workspacesInfo) {
 
     # Skip workspaces with zero items in Tenant Admin mode (optimization)
@@ -2601,10 +3066,26 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extra
     $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items"
 
     try {
-        $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
+        if (-not $fabricAccessToken) { $fabricAccessToken = Get-FabricAccessToken }
+        $fabricItems = @(Invoke-FabricPagedGet -Url $fabricItemsUrl -AccessToken $fabricAccessToken)
 
+        foreach ($fabricItem in $fabricItems) {
+            $itemConnectionsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items/$($fabricItem.id)/connections"
+            try {
+                foreach ($connection in (Invoke-FabricPagedGet -Url $itemConnectionsUrl -AccessToken $fabricAccessToken)) {
+                    $itemConnectionsInfo += [PSCustomObject]@{
+                        WorkspaceId = $workspaceId; WorkspaceName = $workspaceName; FabricItemId = $fabricItem.id
+                        FabricItemName = $fabricItem.displayName; FabricItemType = $fabricItem.type; ConnectionId = $connection.id
+                        ConnectionName = $connection.displayName; GatewayId = $connection.gatewayId; ConnectivityType = $connection.connectivityType
+                        ConnectionType = $connection.connectionDetails.type; ConnectionPath = $connection.connectionDetails.path
+                    }
+                }
+            } catch {
+                Write-Warning "Failed to fetch connections for Fabric item $($fabricItem.id) in workspace $workspaceId. $($_.Exception.Message)"
+            }
+        }
 
-        $filteredItems = $fabricItemsResponse.value | Where-Object {
+        $filteredItems = $fabricItems | Where-Object {
             $_.type -ne 'Report' -and $_.type -ne 'SemanticModel'
         }
 
@@ -2984,6 +3465,9 @@ if (Test-Path $excelFile) {
 
 $allWorkspacesInfoForExcel | Export-Excel -Path $excelFile -WorksheetName "Workspaces" -AutoSize
 $fabricItemsInfo | Export-Excel -Path $excelFile -WorksheetName "FabricItems" -AutoSize -Append
+$connectionsInfo | Export-Excel -Path $excelFile -WorksheetName "Connections" -AutoSize -Append
+$gatewaysInfo | Export-Excel -Path $excelFile -WorksheetName "Gateways" -AutoSize -Append
+$itemConnectionsInfo | Export-Excel -Path $excelFile -WorksheetName "ItemConnections" -AutoSize -Append
 $datasetsInfo | Export-Excel -Path $excelFile -WorksheetName "Datasets" -AutoSize -Append
 $datasetSourcesInfo | Export-Excel -Path $excelFile -WorksheetName "DatasetSourcesInfo" -AutoSize -Append
 $datasetRefreshHistory | Export-Excel -Path $excelFile -WorksheetName "DatasetRefreshHistory" -AutoSize -Append
@@ -4057,6 +4541,10 @@ foreach ($workspace in $workspacesInfo) {
             $dataflowId = $dataflow.objectId
             $dataflowName = $dataflow.name
 
+            if ($global:RunMode -eq 'Models' -and -not $global:SelectedDataflowIds.ContainsKey($dataflowId)) {
+                continue
+            }
+
             # Clean up workspace name
             $cleanWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
             $cleanWorkspaceName = $cleanWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
@@ -4194,6 +4682,10 @@ foreach ($workspace in $workspacesInfo) {
             # Iterate through the Gen2 dataflows
             foreach ($dataflow in $gen2Dataflows) {
                 $dataflowId = $dataflow.id
+
+                if ($global:RunMode -eq 'Models' -and -not $global:SelectedDataflowIds.ContainsKey($dataflowId)) {
+                    continue
+                }
                 $dataflowName = $dataflow.displayName
                 
                 
