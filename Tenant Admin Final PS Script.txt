@@ -700,7 +700,8 @@ function Invoke-FabricPagedGet {
         [Parameter(Mandatory = $true)]
         [string]$Url,
         [Parameter(Mandatory = $true)]
-        [string]$AccessToken
+        [string]$AccessToken,
+        [string]$ResultProperty = 'value'
     )
 
     $results = @()
@@ -708,10 +709,56 @@ function Invoke-FabricPagedGet {
     while ($nextUrl) {
         $headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json' }
         $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET -ErrorAction Stop
-        if ($response.value) { $results += @($response.value) }
+        $pageItems = $response.PSObject.Properties[$ResultProperty].Value
+        if ($pageItems) { $results += @($pageItems) }
         $nextUrl = if ($response.continuationUri) { $response.continuationUri } else { $null }
     }
     return $results
+}
+
+function Get-FabricWorkspaces {
+    param([switch]$Admin)
+
+    $url = if ($Admin) {
+        "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/admin/workspaces"
+    } else {
+        "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces"
+    }
+    $resultProperty = if ($Admin) { 'workspaces' } else { 'value' }
+    $accessToken = Get-FabricAccessToken
+    $workspaces = @(Invoke-FabricPagedGet -Url $url -AccessToken $accessToken -ResultProperty $resultProperty)
+
+    return @($workspaces | ForEach-Object {
+        [pscustomobject]@{
+            id         = $_.id
+            name       = if ($_.name) { $_.name } else { $_.displayName }
+            type       = $_.type
+            state      = $_.state
+            capacityId = $_.capacityId
+            domainId   = $_.domainId
+        }
+    })
+}
+
+function Get-FabricWorkspaceUsers {
+    param([Parameter(Mandatory = $true)][string]$WorkspaceId)
+
+    $url = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/admin/workspaces/$WorkspaceId/users"
+    $accessToken = Get-FabricAccessToken
+    $accessDetails = @(Invoke-FabricPagedGet -Url $url -AccessToken $accessToken -ResultProperty 'accessDetails')
+
+    return @($accessDetails | ForEach-Object {
+        $principal = $_.principal
+        $userPrincipalName = $principal.userDetails.userPrincipalName
+        [pscustomobject]@{
+            identifier               = if ($userPrincipalName) { $userPrincipalName } else { $principal.id }
+            displayName              = $principal.displayName
+            emailAddress             = $userPrincipalName
+            graphId                  = $principal.id
+            principalType            = $principal.type
+            groupUserAccessRight     = $_.workspaceAccessDetails.workspaceRole
+        }
+    })
 }
 
 # Create a variable date
@@ -1726,10 +1773,8 @@ function Get-WorkspaceUsers {
         return @()
     }
     
-    $usersUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$WorkspaceId/users"
     try {
-        $response = Invoke-PowerBIRestMethod -Method GET -Url $usersUrl | ConvertFrom-Json
-        return $response.value
+        return @(Get-FabricWorkspaceUsers -WorkspaceId $WorkspaceId)
     }
     catch {
         Write-Warning "Failed to get users for workspace $WorkspaceId : $_"
@@ -1873,10 +1918,9 @@ function Set-AccessibleWorkspacesMode {
         [string]$BaseFolderPath
     )
     
-    # Get workspaces from regular API (ones user has access to)
-    $regularWorkspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
-    $regularWorkspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $regularWorkspacesUrl | ConvertFrom-Json
-    $accessibleWorkspaceIds = $regularWorkspacesResponse.value | ForEach-Object { $_.id }
+    # Get workspaces from the Fabric Core API (ones the user can access)
+    $accessibleWorkspaces = @(Get-FabricWorkspaces)
+    $accessibleWorkspaceIds = @($accessibleWorkspaces | ForEach-Object { $_.id })
     
     # Filter admin API workspaces to only accessible ones
     # Note: .Value (capital) is the [ref] property, .value (lowercase) is the response data property
@@ -1904,7 +1948,7 @@ function Get-WorkspacesWithFabricItems {
     
     try {
         # Use Fabric Items List Admin API to get all items
-        $fabricBaseUrl = "https://api.fabric.microsoft.com/v1/admin/items"
+        $fabricBaseUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/admin/items"
         $allItems = @()
         $continuationToken = $null
         
@@ -1918,7 +1962,7 @@ function Get-WorkspacesWithFabricItems {
             Write-Host "[INFO] Calling Fabric Admin Items API: $url"
             
             # Get current access token
-            $accessToken = Get-CurrentAccessToken
+            $accessToken = Get-FabricAccessToken
             
             $response = Invoke-RestMethod `
                 -Method GET `
@@ -1985,17 +2029,15 @@ function New-TenantPermissionWorkspaceList {
     
     Write-Host "[INFO] Creating Tenant Permission Workspace List..."
     
-    # First get the user's existing workspace access (regular API)
+    # First get the user's existing workspace access from the Fabric Core API
     try {
-        $userWorkspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
-        $userWorkspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $userWorkspacesUrl | ConvertFrom-Json
-        
-        # Check if response is valid
-        if ($null -eq $userWorkspacesResponse -or $null -eq $userWorkspacesResponse.value) {
+        $userWorkspaces = @(Get-FabricWorkspaces)
+
+        if ($userWorkspaces.Count -eq 0) {
             Write-Warning "User workspace API returned no data. Assuming user has no direct workspace access."
             $userWorkspaceIds = @()
         } else {
-            $userWorkspaceIds = @($userWorkspacesResponse.value.id)
+            $userWorkspaceIds = @($userWorkspaces.id)
         }
     }
     catch {
@@ -2040,7 +2082,7 @@ function New-TenantPermissionWorkspaceList {
         }
     }
     
-Write-Host "[INFO] Admin API shows $($AdminWorkspaces.Count) total workspace(s)"
+Write-Host "[INFO] Fabric Admin API shows $($AdminWorkspaces.Count) total workspace(s)"
 Write-Host "[INFO] Found $($userWorkspaceIds.Count) workspace(s) where the user has direct access"
 Write-Host "[INFO] Found $($zeroAccessWorkspaces.Count) workspace(s) with no user access"
     
@@ -2190,46 +2232,29 @@ $global:SelectedDatasetIds = @{}
 $global:SelectedReportIds = @{}
 $global:SelectedDataflowIds = @{}
 
-Write-Host "[INFO] Attempting to use Admin API to discover all tenant workspaces..."
-
-$adminWorkspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups?`$top=1"
+Write-Host "[INFO] Attempting to use the Fabric Admin API to discover all tenant workspaces..."
 
 try {
-    $rawResponse = Invoke-PowerBIRestMethod -Method GET -Url $adminWorkspacesUrl
+    $adminWorkspaces = @(Get-FabricWorkspaces -Admin)
+    $hasAdminAccess = $true
+    $usingAdminAPI = $true
+    $workspacesResponse = [pscustomobject]@{ value = $adminWorkspaces }
 
-    if (-not [string]::IsNullOrWhiteSpace($rawResponse)) {
-        $adminResponse = $rawResponse | ConvertFrom-Json
-
-        if ($adminResponse.value -and $adminResponse.value.Count -gt 0) {
-            # ✅ CONFIRMED tenant admin
-            $hasAdminAccess = $true
-            $usingAdminAPI  = $true
-
-            Write-Host "[SUCCESS] Admin API access confirmed"
-
-            # Re-run with full admin query
-            $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups?`$top=1000"
-            $workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
-
-            Write-Host "[INFO] Admin API discovered $($workspacesResponse.value.Count) workspaces"
-        }
-        else {
-            Write-Host "[INFO] Admin API returned no workspaces - treating as non-admin"
-        }
-    }
+    Write-Host "[SUCCESS] Fabric Admin API access confirmed"
+    Write-Host "[INFO] Fabric Admin API discovered $($adminWorkspaces.Count) workspaces"
 }
 catch {
-    Write-Host "[INFO] Admin API call failed - treating as non-admin"
+    Write-Host "[INFO] Fabric Admin API call failed - treating as non-admin"
 }
 
-# Fallback to regular API if not admin
+# Fallback to the Fabric Core API if not admin
 if (-not $hasAdminAccess) {
-    Write-Host "[INFO] Falling back to regular API - will only see workspaces you have access to"
+    Write-Host "[INFO] Falling back to the Fabric Core API - will only see workspaces you have access to"
 
-    $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
-    $workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
+    $accessibleWorkspaces = @(Get-FabricWorkspaces)
+    $workspacesResponse = [pscustomobject]@{ value = $accessibleWorkspaces }
 
-    Write-Host "[INFO] Regular API discovered $($workspacesResponse.value.Count) workspaces"
+    Write-Host "[INFO] Fabric Core API discovered $($workspacesResponse.value.Count) workspaces"
 }
 
 # Only show role selection dialog if user has admin access
@@ -2260,10 +2285,10 @@ if ($hasAdminAccess) {
             Write-Host "[INFO] User selected 'User Role' mode - will use regular APIs only"
             $userChoiceForceUserMode = $true
             $usingAdminAPI = $false
-            # Fetch workspaces using regular API instead
-            $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
-            $workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
-            Write-Host "[INFO] Regular API discovered $($workspacesResponse.value.Count) workspaces"
+            # Fetch workspaces using the Fabric Core API instead
+            $accessibleWorkspaces = @(Get-FabricWorkspaces)
+            $workspacesResponse = [pscustomobject]@{ value = $accessibleWorkspaces }
+            Write-Host "[INFO] Fabric Core API discovered $($workspacesResponse.value.Count) workspaces"
         }
         elseif ($roleChoice -eq 'Accessible') {
             Write-Host "[INFO] User selected 'Only Accessible Workspaces' mode - will use admin APIs for accessible workspaces only"
@@ -3191,7 +3216,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
     try {
         $fabricDataflowsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$($workspace.WorkspaceId)/dataflows"
         $fabricHeaders = @{
-            'Authorization' = "Bearer $(Get-CurrentAccessToken)"
+            'Authorization' = "Bearer $(Get-FabricAccessToken)"
             'Content-Type' = 'application/json'
         }
         $fabricDataflowsResponse = Invoke-RestMethod -Uri $fabricDataflowsUrl -Headers $fabricHeaders -Method GET -ErrorAction Stop
@@ -3634,10 +3659,9 @@ if ($usingAdminAPI) {
         }
         
         try {
-            $workspaceUsersUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$($workspace.WorkspaceId)/users"
-            $workspaceUsersResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspaceUsersUrl | ConvertFrom-Json
-            
-            foreach ($user in $workspaceUsersResponse.value) {
+            $workspaceUsersResponse = @(Get-FabricWorkspaceUsers -WorkspaceId $workspace.WorkspaceId)
+
+            foreach ($user in $workspaceUsersResponse) {
                 $userRecord = [PSCustomObject]@{
                     WorkspaceId = $workspace.WorkspaceId
                     WorkspaceName = $workspace.WorkspaceName
@@ -3962,7 +3986,7 @@ function Export-ReportDefinitionAsPbix {
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-    $accessToken = Get-CurrentAccessToken
+    $accessToken = Get-FabricAccessToken
     $headers = @{ Authorization = "Bearer $accessToken"; 'Content-Type' = 'application/json' }
     $defUrl  = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$WorkspaceId/reports/$ReportId/getDefinition"
 
@@ -4940,10 +4964,10 @@ foreach ($workspace in $workspacesInfo) {
     
     try {
         # Get the list of items in the workspace
-        $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
+        $fabricItems = @(Invoke-FabricPagedGet -Url $fabricItemsUrl -AccessToken (Get-FabricAccessToken))
         
         # Filter for Dataflow items (Gen2 dataflows)
-        $gen2Dataflows = $fabricItemsResponse.value | Where-Object { $_.type -eq 'Dataflow' }
+        $gen2Dataflows = $fabricItems | Where-Object { $_.type -eq 'Dataflow' }
         
         if ($gen2Dataflows -and $gen2Dataflows.Count -gt 0) {
             
@@ -4957,8 +4981,8 @@ foreach ($workspace in $workspacesInfo) {
                 $dataflowName = $dataflow.displayName
                 
                 
-                # Get current access token
-                $currentAccessToken = Get-CurrentAccessToken
+                # Get a Fabric-scoped access token
+                $currentAccessToken = Get-FabricAccessToken
                 
                 # Download and extract Fabric dataflow
                 $fabricResult = Export-FabricDataflow -WorkspaceId $workspaceId `
