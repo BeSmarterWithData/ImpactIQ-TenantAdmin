@@ -711,9 +711,35 @@ function Invoke-FabricPagedGet {
         $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET -ErrorAction Stop
         $pageItems = $response.PSObject.Properties[$ResultProperty].Value
         if ($pageItems) { $results += @($pageItems) }
-        $nextUrl = if ($response.continuationUri) { $response.continuationUri } else { $null }
+        $nextUrl = if ($response.continuationUri) {
+            $response.continuationUri
+        } elseif ($response.continuationToken) {
+            $separator = if ($Url.Contains('?')) { '&' } else { '?' }
+            "$Url${separator}continuationToken=$([Uri]::EscapeDataString($response.continuationToken))"
+        } else {
+            $null
+        }
     }
     return $results
+}
+
+function Get-AdminItemUsers {
+    param(
+        [Parameter(Mandatory = $true)][string]$ItemId,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$WorkspaceId,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('SemanticModel', 'Report', 'App', 'Dataflow')]
+        [string]$Type
+    )
+
+    $powerBIResource = switch ($Type) {
+        'SemanticModel' { 'datasets' }
+        'Report' { 'reports' }
+        'App' { 'apps' }
+        'Dataflow' { 'dataflows' }
+    }
+    $url = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/$powerBIResource/$ItemId/users"
+    return @((Invoke-PowerBIRestMethod -Method GET -Url $url | ConvertFrom-Json).value)
 }
 
 function Get-FabricWorkspaces {
@@ -740,25 +766,32 @@ function Get-FabricWorkspaces {
     })
 }
 
-function Get-FabricWorkspaceUsers {
+function Get-PowerBIWorkspaceDetails {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkspaceId,
+        [switch]$Admin
+    )
+
+    $url = if ($Admin) {
+        "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$WorkspaceId"
+    } else {
+        "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$WorkspaceId"
+    }
+    $workspace = Invoke-PowerBIRestMethod -Method GET -Url $url | ConvertFrom-Json
+    if ($workspace.id -eq $WorkspaceId -and $null -eq $workspace.isOnDedicatedCapacity) {
+        $workspace | Add-Member -NotePropertyName 'isOnDedicatedCapacity' -NotePropertyValue $false -Force
+    }
+    if ($workspace.id -ne $WorkspaceId -or $workspace.isOnDedicatedCapacity -isnot [bool]) {
+        throw "Power BI did not return valid workspace details and dedicated-capacity status for $WorkspaceId."
+    }
+    return $workspace
+}
+
+function Get-PowerBIWorkspaceUsers {
     param([Parameter(Mandatory = $true)][string]$WorkspaceId)
 
-    $url = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/admin/workspaces/$WorkspaceId/users"
-    $accessToken = Get-FabricAccessToken
-    $accessDetails = @(Invoke-FabricPagedGet -Url $url -AccessToken $accessToken -ResultProperty 'accessDetails')
-
-    return @($accessDetails | ForEach-Object {
-        $principal = $_.principal
-        $userPrincipalName = $principal.userDetails.userPrincipalName
-        [pscustomobject]@{
-            identifier               = if ($userPrincipalName) { $userPrincipalName } else { $principal.id }
-            displayName              = $principal.displayName
-            emailAddress             = $userPrincipalName
-            graphId                  = $principal.id
-            principalType            = $principal.type
-            groupUserAccessRight     = $_.workspaceAccessDetails.workspaceRole
-        }
-    })
+    $url = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$WorkspaceId/users"
+    return @((Invoke-PowerBIRestMethod -Method GET -Url $url | ConvertFrom-Json).value)
 }
 
 # Create a variable date
@@ -1513,15 +1546,15 @@ function Select-ModelRunScope {
     foreach ($workspace in $workspacesToScan) {
         $workspaceIndex++
         Write-Host "`r[INFO] Scanning workspace $workspaceIndex of $(@($workspacesToScan).Count): $($workspace.name)" -NoNewline
-        $datasetsUrl = if ($UseAdminApi) {
-            "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$($workspace.id)/datasets"
-        } else {
-            "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.id)/datasets"
-        }
-
         try {
-            $datasetsResponse = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
-            foreach ($dataset in $datasetsResponse.value) {
+            $datasets = if ($UseAdminApi) {
+                $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/groups/$($workspace.id)/datasets"
+                (Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json).value
+            } else {
+                $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.id)/datasets"
+                (Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json).value
+            }
+            foreach ($dataset in $datasets) {
                 $allModelsForPicker += [pscustomobject]@{
                     DatasetId = $dataset.id
                     DatasetName = $dataset.name
@@ -1774,7 +1807,7 @@ function Get-WorkspaceUsers {
     }
     
     try {
-        return @(Get-FabricWorkspaceUsers -WorkspaceId $WorkspaceId)
+        return @(Get-PowerBIWorkspaceUsers -WorkspaceId $WorkspaceId)
     }
     catch {
         Write-Warning "Failed to get users for workspace $WorkspaceId : $_"
@@ -1936,79 +1969,29 @@ function Set-AccessibleWorkspacesMode {
     }
 }
 
-# Helper function to get workspace IDs that have Fabric items
 function Get-WorkspacesWithFabricItems {
-    param (
-        [Parameter(Mandatory=$true)]
-        [array]$WorkspaceIds
+    param(
+        [Parameter(Mandatory = $true)][array]$WorkspaceIds
     )
-    
-    Write-Host "[INFO] Checking which workspaces have Fabric/Power BI items..."
+
     $workspacesWithItems = @{}
-    
     try {
-        # Use Fabric Items List Admin API to get all items
-        $fabricBaseUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/admin/items"
-        $allItems = @()
-        $continuationToken = $null
-        
-        do {
-            $url = $fabricBaseUrl
-            
-            if ($continuationToken) {
-                $url += "?continuationToken=$continuationToken"
+        $url = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/admin/items"
+        $allItems = @(Invoke-FabricPagedGet -Url $url -AccessToken (Get-FabricAccessToken) -ResultProperty 'itemEntities')
+        foreach ($item in $allItems) {
+            if ($item.type -in @('Report', 'SemanticModel') -and $item.name -eq 'Getting Started in Power BI') {
+                continue
             }
-            
-            Write-Host "[INFO] Calling Fabric Admin Items API: $url"
-            
-            # Get current access token
-            $accessToken = Get-FabricAccessToken
-            
-            $response = Invoke-RestMethod `
-                -Method GET `
-                -Uri $url `
-                -Headers @{ Authorization = "Bearer $accessToken" } `
-                -ErrorAction Stop
-            
-            if ($response.itemEntities) {
-                $allItems += $response.itemEntities
-            }
-            
-            $continuationToken = $response.continuationToken
-            
-        } while ($continuationToken)
-        
-        Write-Host "[INFO] Retrieved $($allItems.Count) total Fabric/Power BI items from tenant"
-        
-        # Filter out system items: Reports or SemanticModels named 'Getting Started in Power BI'
-        $filteredItems = $allItems | Where-Object {
-            -not (
-                ($_.type -eq "Report" -or $_.type -eq "SemanticModel") -and
-                $_.name -eq "Getting Started in Power BI"
-            )
-        }
-        
-        $excludedCount = $allItems.Count - $filteredItems.Count
-        if ($excludedCount -gt 0) {
-            Write-Host "[INFO] Excluded $excludedCount system item(s) (Getting Started in Power BI)"
-        }
-        
-        # Group items by workspace and count them
-        if ($filteredItems -and $filteredItems.Count -gt 0) {
-            foreach ($item in $filteredItems) {
-                if ($item.workspaceId -and $WorkspaceIds -contains $item.workspaceId) {
-                    if (-not $workspacesWithItems.ContainsKey($item.workspaceId)) {
-                        $workspacesWithItems[$item.workspaceId] = 0
-                    }
-                    $workspacesWithItems[$item.workspaceId]++
+            if ($item.workspaceId -and $WorkspaceIds -contains $item.workspaceId) {
+                if (-not $workspacesWithItems.ContainsKey($item.workspaceId)) {
+                    $workspacesWithItems[$item.workspaceId] = 0
                 }
+                $workspacesWithItems[$item.workspaceId]++
             }
         }
-    }
-    catch {
+    } catch {
         Write-Warning "Failed to retrieve Fabric items using admin API: $_"
     }
-    
     Write-Host "[INFO] Found $($workspacesWithItems.Count) workspace(s) with items out of $($WorkspaceIds.Count) selected"
     return $workspacesWithItems
 }
@@ -2658,64 +2641,38 @@ if ($global:RunMode -in @('Reports', 'Models')) {
     if (-not $IncludeMyWorkspace)      { $IncludeMyWorkspace = $false }
 }
 
+$workspacesInfo = @(
+    foreach ($workspace in $workspacesInfo) {
+        Write-Host "[INFO] Fetching Power BI workspace details: $($workspace.WorkspaceName)"
+        $workspaceDetails = Get-PowerBIWorkspaceDetails -WorkspaceId $workspace.WorkspaceId -Admin:$usingAdminAPI
+        Rename-Properties -object $workspaceDetails -renameMap $workspaceRenameMap
+    }
+)
+
 # Preserve the full workspace list (all selected + personal) for the Workspaces Excel sheet.
-# This must be captured BEFORE Tenant Admin mode filters $workspacesInfo down to only workspaces with items.
 $allWorkspacesInfoForExcel = @($workspacesInfo)
 
 # =============================
 # Create Tenant Permission Workspace List (for Tenant Admin Mode only)
 # =============================
-# Initialize global variable to track workspaces with items (used later to skip empty workspaces)
 $global:workspaceItemCounts = @{}
 
 if ($isTenantAdminMode) {
     Write-Host "[INFO] Tenant Admin Mode: Filtering workspaces by those with Fabric/Power BI items..."
-    
-    # Get workspace IDs that have items from the selected workspaces (returns hashtable with counts)
-    # Include personal workspace IDs when Select All was used, so they get proper item tracking
-    $allWorkspaceIdsForItemCheck = @($selectedWorkspaceIds)
-    if ($allNonPersonalSelected -and $personalWorkspaces.Count -gt 0) {
-        $allWorkspaceIdsForItemCheck += @($personalWorkspaces | ForEach-Object { $_.id })
-        Write-Host "[INFO] Including $($personalWorkspaces.Count) Personal/PersonalGroup workspace(s) in item check"
-    }
-    
+    $allWorkspaceIdsForItemCheck = @($workspacesInfo | ForEach-Object { $_.WorkspaceId })
     $workspacesWithItemsHash = @{}
-    if ($allWorkspaceIdsForItemCheck -and $allWorkspaceIdsForItemCheck.Count -gt 0) {
+    if ($allWorkspaceIdsForItemCheck.Count -gt 0) {
         $workspacesWithItemsHash = Get-WorkspacesWithFabricItems -WorkspaceIds $allWorkspaceIdsForItemCheck
     }
-    
-    # Store the item counts globally for later use
     $global:workspaceItemCounts = $workspacesWithItemsHash
-    
-    # Filter admin workspaces to only those that:
-    # 1. Were selected in the workspace picker
-    # 2. Have at least one Fabric/Power BI item
     $filteredAdminWorkspaces = @($workspacesResponse.value | Where-Object {
         $selectedWorkspaceIds -contains $_.id -and $workspacesWithItemsHash.ContainsKey($_.id)
     })
-    
-    if ($filteredAdminWorkspaces -and $filteredAdminWorkspaces.Count -gt 0) {
-        Write-Host "[INFO] Creating Tenant Permission Workspace List for $($filteredAdminWorkspaces.Count) workspace(s) with items..."
+    if ($filteredAdminWorkspaces.Count -gt 0) {
         New-TenantPermissionWorkspaceList -AdminWorkspaces $filteredAdminWorkspaces -BaseFolderPath $baseFolderPath
-        
-        # IMPORTANT: In Tenant Admin mode, filter $workspacesInfo to only workspaces with items
-        # This ensures grant/revoke permissions only applies to workspaces that need it
-        # Personal/PersonalGroup workspaces are included here if they have items (their IDs
-        # were added to the item check above when Select All was used)
-        Write-Host "[INFO] Filtering workspace processing to only workspaces with items..."
-        $workspacesInfo = @($workspacesInfo | Where-Object { $workspacesWithItemsHash.ContainsKey($_.WorkspaceId) })
-        Write-Host "[INFO] Will process $($workspacesInfo.Count) workspace(s) with items"
-        
-        # Display item counts per workspace
-        foreach ($ws in $workspacesInfo) {
-            $itemCount = $workspacesWithItemsHash[$ws.WorkspaceId]
-            Write-Host "[INFO]   - $($ws.WorkspaceName): $itemCount item(s)"
-        }
-    } else {
-        Write-Host "[INFO] No selected workspaces with items found - Tenant Permission Workspace List will not be created"
-        # No workspaces with items, so clear workspacesInfo to prevent any processing
-        $workspacesInfo = @()
     }
+    $workspacesInfo = @($workspacesInfo | Where-Object { $workspacesWithItemsHash.ContainsKey($_.WorkspaceId) })
+    Write-Host "[INFO] Will process $($workspacesInfo.Count) workspace(s) with items"
 }
 
 # =============================
@@ -3568,10 +3525,9 @@ if ($usingAdminAPI) {
     Write-Output "Fetching Dataset Users..."
     foreach ($dataset in $datasetsInfo) {
         try {
-            $datasetUsersUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/datasets/$($dataset.DatasetId)/users"
-            $datasetUsersResponse = Invoke-PowerBIRestMethod -Method GET -Url $datasetUsersUrl | ConvertFrom-Json
+            $datasetUsersResponse = @(Get-AdminItemUsers -WorkspaceId $dataset.WorkspaceId -ItemId $dataset.DatasetId -Type 'SemanticModel')
             
-            foreach ($user in $datasetUsersResponse.value) {
+            foreach ($user in $datasetUsersResponse) {
                 $userRecord = [PSCustomObject]@{
                     DatasetId = $dataset.DatasetId
                     DatasetName = $dataset.DatasetName
@@ -3597,10 +3553,9 @@ if ($usingAdminAPI) {
     Write-Output "Fetching App Users..."
     foreach ($app in $appsInfo) {
         try {
-            $appUsersUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/apps/$($app.AppId)/users"
-            $appUsersResponse = Invoke-PowerBIRestMethod -Method GET -Url $appUsersUrl | ConvertFrom-Json
+            $appUsersResponse = @(Get-AdminItemUsers -WorkspaceId $app.AppWorkspaceId -ItemId $app.AppId -Type 'App')
             
-            foreach ($user in $appUsersResponse.value) {
+            foreach ($user in $appUsersResponse) {
                 $userRecord = [PSCustomObject]@{
                     AppId = $app.AppId
                     AppName = $app.AppName
@@ -3625,10 +3580,9 @@ if ($usingAdminAPI) {
     Write-Output "Fetching Dataflow Users..."
     foreach ($dataflow in $dataflowsInfo) {
         try {
-            $dataflowUsersUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/dataflows/$($dataflow.DataflowId)/users"
-            $dataflowUsersResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowUsersUrl | ConvertFrom-Json
+            $dataflowUsersResponse = @(Get-AdminItemUsers -WorkspaceId $dataflow.WorkspaceId -ItemId $dataflow.DataflowId -Type 'Dataflow')
             
-            foreach ($user in $dataflowUsersResponse.value) {
+            foreach ($user in $dataflowUsersResponse) {
                 $userRecord = [PSCustomObject]@{
                     DataflowId = $dataflow.DataflowId
                     DataflowName = $dataflow.DataflowName
@@ -3659,7 +3613,7 @@ if ($usingAdminAPI) {
         }
         
         try {
-            $workspaceUsersResponse = @(Get-FabricWorkspaceUsers -WorkspaceId $workspace.WorkspaceId)
+            $workspaceUsersResponse = @(Get-PowerBIWorkspaceUsers -WorkspaceId $workspace.WorkspaceId)
 
             foreach ($user in $workspaceUsersResponse) {
                 $userRecord = [PSCustomObject]@{
@@ -3685,10 +3639,9 @@ if ($usingAdminAPI) {
     Write-Output "Fetching Report Users..."
     foreach ($report in $reportsInfo) {
         try {
-            $reportUsersUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/admin/reports/$($report.ReportId)/users"
-            $reportUsersResponse = Invoke-PowerBIRestMethod -Method GET -Url $reportUsersUrl | ConvertFrom-Json
+            $reportUsersResponse = @(Get-AdminItemUsers -WorkspaceId $report.WorkspaceId -ItemId $report.ReportId -Type 'Report')
             
-            foreach ($user in $reportUsersResponse.value) {
+            foreach ($user in $reportUsersResponse) {
                 $userRecord = [PSCustomObject]@{
                     ReportId = $report.ReportId
                     ReportName = $report.ReportName
